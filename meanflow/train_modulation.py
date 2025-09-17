@@ -68,11 +68,11 @@ def parse_args():
                        help='Weight decay for regularization')
     parser.add_argument('--class_dropout', type=float, default=0.1,
                        help='Class dropout for classifier-free guidance')
-    parser.add_argument('--use_arcface', action='store_true', default=True,
+    parser.add_argument('--use_arcface', action='store_true',
                        help='Use ArcFace loss for better class separation')
     parser.add_argument('--arcface_margin', type=float, default=0.5,
                        help='ArcFace margin parameter')
-    parser.add_argument('--arcface_scale', type=float, default=30.0,
+    parser.add_argument('--arcface_scale', type=float, default=15.0,
                        help='ArcFace scale parameter')
     
     # Energy loss hyperparameters
@@ -84,9 +84,9 @@ def parse_args():
                        help='Weight for positive energy loss')
     parser.add_argument('--lambda_neg', type=float, default=0.1,
                        help='Weight for negative energy loss')
-    parser.add_argument('--margin_pos', type=float, default=0.1,
+    parser.add_argument('--margin_pos', type=float, default=0.05,
                        help='Margin for positive energy (should be small)')
-    parser.add_argument('--margin_neg', type=float, default=1.0,
+    parser.add_argument('--margin_neg', type=float, default=0.3,
                        help='Margin for negative energy (should be large)')
     
     # Training arguments
@@ -359,11 +359,12 @@ def train_epoch(
         current_lr = optimizer.param_groups[0]['lr']
         progress_bar.set_postfix({
             'Loss': f'{current_loss:.4f}',
-            'ReconLoss': f'{(reconstruction_loss / num_batches):.4f}',
-            'ArcLoss': f'{(arcface_loss / num_batches):.4f}' if args.use_arcface else '0.0000',
-            'PosEng': f'{(pos_energy_loss / num_batches):.4f}',
-            'NegEng': f'{(neg_energy_loss / num_batches):.4f}',
-            'LR': f'{current_lr:.2e}',
+            'Rec': f'{(reconstruction_loss / num_batches):.4f}',
+            'Pos': f'{(pos_energy_loss / num_batches):.4f}',
+            'Neg': f'{(neg_energy_loss / num_batches):.4f}',
+            'lr': f'{current_lr:.2e}',
+            'Arc': f'{(arcface_loss / num_batches):.4f}' if args.use_arcface else '0.0000',
+
         })
     
     # Compute average metrics

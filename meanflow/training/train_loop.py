@@ -16,6 +16,7 @@ from torchmetrics.aggregation import MeanMetric
 import torch.distributed as dist
 from models.augment import AugmentPipe
 import models.rng as rng
+from tqdm import tqdm
 
 
 logger = logging.getLogger(__name__)
@@ -94,8 +95,17 @@ def train_one_epoch(
     # declare the unwrapped model
     model_without_ddp = model if not isinstance(model, DistributedDataParallel) else model.module
 
+    # Training loop with progress bar
+    progress_bar = tqdm(
+        enumerate(data_loader), 
+        total=len(data_loader),
+        desc=f'Epoch {epoch}',
+        leave=False,
+        ncols=120
+    )
+    
     tic = time.time()
-    for data_iter_step, (samples, index) in enumerate(data_loader):
+    for data_iter_step, (samples, index) in progress_bar:
         steps = data_iter_step + len(data_loader) * epoch  # global step
 
         optimizer.zero_grad()            
@@ -136,6 +146,14 @@ def train_one_epoch(
 
         lr = optimizer.param_groups[0]["lr"]
         lr_schedule.step()  # per-iteration lr
+        
+        # Update progress bar with current metrics
+        progress_bar.set_postfix({
+            'Loss': f'{loss_value:.6f}',
+            'LR': f'{lr:.2e}',
+            'Steps': f'{steps}',
+        })
+        
         if (steps + 1) % args.log_per_step == 0:
             loss_ave = batch_loss.compute().detach().cpu().numpy() # logging only
             sec_per_iter = batch_time.compute()

@@ -411,7 +411,7 @@ class MeanFlowModulation(nn.Module):
                     
                     # Compute reconstruction error as energy
                     error = (x - x_recon)**2
-                    error = error.sum(dim=(1, 2))  # Sum over channel and time dimensions
+                    error = error.mean(dim=(1, 2))  # Mean over channel and time dimensions
                     
                     energies.append(error)
             

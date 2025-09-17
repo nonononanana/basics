@@ -68,7 +68,7 @@ def parse_args():
                        help='Weight decay for regularization')
     parser.add_argument('--class_dropout', type=float, default=0.1,
                        help='Class dropout for classifier-free guidance')
-    parser.add_argument('--use_arcface', action='store_true',
+    parser.add_argument('--use_arcface', action='store_true', default=True,
                        help='Use ArcFace loss for better class separation')
     parser.add_argument('--arcface_margin', type=float, default=0.5,
                        help='ArcFace margin parameter')
@@ -84,9 +84,9 @@ def parse_args():
                        help='Weight for positive energy loss')
     parser.add_argument('--lambda_neg', type=float, default=0.1,
                        help='Weight for negative energy loss')
-    parser.add_argument('--margin_pos', type=float, default=1,
+    parser.add_argument('--margin_pos', type=float, default=0.1,
                        help='Margin for positive energy (should be small)')
-    parser.add_argument('--margin_neg', type=float, default=3,
+    parser.add_argument('--margin_neg', type=float, default=1.0,
                        help='Margin for negative energy (should be large)')
     
     # Training arguments

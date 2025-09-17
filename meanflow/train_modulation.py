@@ -84,10 +84,10 @@ def parse_args():
                        help='Weight for positive energy loss')
     parser.add_argument('--lambda_neg', type=float, default=0.1,
                        help='Weight for negative energy loss')
-    parser.add_argument('--margin_pos', type=float, default=0.0005,
-                       help='Margin for positive energy (should be small)')
-    parser.add_argument('--margin_neg', type=float, default=1,
-                       help='Margin for negative energy (should be large)')
+    parser.add_argument('--margin_pos', type=float, default=-1.8,
+                       help='Margin for positive energy (should be more negative, e.g., -1.8)')
+    parser.add_argument('--margin_neg', type=float, default=-0.5,
+                       help='Margin for negative energy (should be less negative/closer to 0, e.g., -0.5)')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=1024,

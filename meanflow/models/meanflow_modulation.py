@@ -284,8 +284,11 @@ class MeanFlowModulation(nn.Module):
                 # Compute energy score for positive samples
                 pos_energies = self.compute_energy_score(x_pos, return_per_class=False)
             
-            # L_pos = max(0, E(x) - m_pos)
-            # We want positive samples to have low energy
+            # Energy scores are NEGATIVE (e.g., -0.5 to -0.01)
+            # For in-distribution (positive) samples, we want MORE negative values
+            # L_pos = max(0, E(x) - margin_pos) where margin_pos should be negative
+            # Example: if E(x) = -0.1 and margin_pos = -0.3, loss = max(0, -0.1 - (-0.3)) = 0.2
+            # This penalizes samples that aren't negative enough
             pos_energy_loss = F.relu(pos_energies - margin_pos).mean()
         
         # Compute energy losses for negative samples
@@ -295,8 +298,11 @@ class MeanFlowModulation(nn.Module):
                 # Compute energy score for negative samples
                 neg_energies = self.compute_energy_score(x_neg, return_per_class=False)
             
-            # L_neg = max(0, m_neg - E(x))
-            # We want negative samples to have high energy
+            # Energy scores are NEGATIVE (e.g., -0.5 to -0.01)
+            # For out-of-distribution (negative) samples, we want LESS negative values (closer to 0)
+            # L_neg = max(0, margin_neg - E(x)) where margin_neg should be negative but closer to 0
+            # Example: if E(x) = -0.4 and margin_neg = -0.05, loss = max(0, -0.05 - (-0.4)) = 0.35
+            # This penalizes samples that are too negative (too similar to in-distribution)
             neg_energy_loss = F.relu(margin_neg - neg_energies).mean()
         
         # Total loss with weighted components

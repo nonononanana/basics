@@ -82,11 +82,11 @@ def parse_args():
                        help='Weight for ArcFace loss')
     parser.add_argument('--lambda_pos', type=float, default=0.1,
                        help='Weight for positive energy loss')
-    parser.add_argument('--lambda_neg', type=float, default=0.5,
+    parser.add_argument('--lambda_neg', type=float, default=0.1,
                        help='Weight for negative energy loss')
-    parser.add_argument('--margin_pos', type=float, default=0.1,
+    parser.add_argument('--margin_pos', type=float, default=1,
                        help='Margin for positive energy (should be small)')
-    parser.add_argument('--margin_neg', type=float, default=0.5,
+    parser.add_argument('--margin_neg', type=float, default=3,
                        help='Margin for negative energy (should be large)')
     
     # Training arguments

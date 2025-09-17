@@ -76,7 +76,7 @@ def parse_args():
                        help='ArcFace scale parameter')
     
     # Energy loss hyperparameters
-    parser.add_argument('--lambda_rec', type=float, default=0.1,
+    parser.add_argument('--lambda_rec', type=float, default=1,
                        help='Weight for reconstruction loss')
     parser.add_argument('--lambda_arc', type=float, default=5.0,
                        help='Weight for ArcFace loss')
@@ -84,15 +84,15 @@ def parse_args():
                        help='Weight for positive energy loss')
     parser.add_argument('--lambda_neg', type=float, default=0.1,
                        help='Weight for negative energy loss')
-    parser.add_argument('--margin_pos', type=float, default=0.05,
+    parser.add_argument('--margin_pos', type=float, default=0.0005,
                        help='Margin for positive energy (should be small)')
-    parser.add_argument('--margin_neg', type=float, default=0.3,
+    parser.add_argument('--margin_neg', type=float, default=1,
                        help='Margin for negative energy (should be large)')
     
     # Training arguments
-    parser.add_argument('--batch_size', type=int, default=64,
+    parser.add_argument('--batch_size', type=int, default=1024,
                        help='Batch size for training')
-    parser.add_argument('--eval_batch_size', type=int, default=1024,
+    parser.add_argument('--eval_batch_size', type=int, default=2048,
                        help='Batch size for evaluation')
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of training epochs')

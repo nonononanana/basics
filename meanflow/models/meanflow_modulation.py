@@ -259,7 +259,7 @@ class MeanFlowModulation(nn.Module):
             
             # Mean flow reconstruction loss
             reconstruction_loss = (u_pred - u_tgt)**2
-            reconstruction_loss = reconstruction_loss.sum(dim=(1, 2))  # Sum over channel and time dimensions
+            reconstruction_loss = reconstruction_loss.mean(dim=(1, 2))  # Mean over channel and time dimensions
             
             # Adaptive weighting for stability
             adp_wt = (reconstruction_loss.detach() + self.args.norm_eps) ** self.args.norm_p

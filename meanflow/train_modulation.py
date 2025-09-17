@@ -76,7 +76,7 @@ def parse_args():
                        help='ArcFace scale parameter')
     
     # Energy loss hyperparameters
-    parser.add_argument('--lambda_rec', type=float, default=1.0,
+    parser.add_argument('--lambda_rec', type=float, default=0.1,
                        help='Weight for reconstruction loss')
     parser.add_argument('--lambda_arc', type=float, default=5.0,
                        help='Weight for ArcFace loss')
@@ -92,11 +92,11 @@ def parse_args():
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=64,
                        help='Batch size for training')
-    parser.add_argument('--eval_batch_size', type=int, default=128,
+    parser.add_argument('--eval_batch_size', type=int, default=1024,
                        help='Batch size for evaluation')
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=1e-4,
+    parser.add_argument('--lr', type=float, default=2e-4,
                        help='Learning rate')
     parser.add_argument('--warmup_epochs', type=int, default=5,
                        help='Number of warmup epochs')
@@ -110,9 +110,9 @@ def parse_args():
                        help='Use mixed precision training')
     
     # Mean flow specific arguments
-    parser.add_argument('--norm_eps', type=float, default=1e-5,
+    parser.add_argument('--norm_eps', type=float, default=1e-3,
                        help='Epsilon for adaptive normalization')
-    parser.add_argument('--norm_p', type=float, default=-0.5,
+    parser.add_argument('--norm_p', type=float, default=0.75,
                        help='Power for adaptive normalization')
     parser.add_argument('--num_timesteps', type=int, default=1000,
                        help='Number of diffusion timesteps')

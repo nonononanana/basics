@@ -76,13 +76,13 @@ def parse_args():
                        help='ArcFace scale parameter')
     
     # Energy loss hyperparameters
-    parser.add_argument('--lambda_rec', type=float, default=1,
+    parser.add_argument('--lambda_rec', type=float, default=1.0,
                        help='Weight for reconstruction loss')
-    parser.add_argument('--lambda_arc', type=float, default=5.0,
+    parser.add_argument('--lambda_arc', type=float, default=0.5,
                        help='Weight for ArcFace loss')
-    parser.add_argument('--lambda_pos', type=float, default=0.1,
+    parser.add_argument('--lambda_pos', type=float, default=0.5,
                        help='Weight for positive energy loss')
-    parser.add_argument('--lambda_neg', type=float, default=0.1,
+    parser.add_argument('--lambda_neg', type=float, default=0.5,
                        help='Weight for negative energy loss')
     parser.add_argument('--margin_pos', type=float, default=-2.2,
                        help='Margin for positive energy (should be more negative, e.g., -2.2)')

@@ -310,11 +310,13 @@ class RML2016Dataset(Dataset):
             else:
                 # Generate negative sample on-the-fly (slower but uses less memory)
                 negative_sample = self._create_negative_sample(positive_sample.copy())
+        else:
+            # For test split, create a dummy negative sample (not used in evaluation but needed for collation)
+            negative_sample = np.zeros_like(positive_sample)
         
         # Convert to torch tensors
         positive_sample = torch.from_numpy(positive_sample).float()
-        if negative_sample is not None:
-            negative_sample = torch.from_numpy(negative_sample).float()
+        negative_sample = torch.from_numpy(negative_sample).float()
         
         # Prepare additional info
         info = {

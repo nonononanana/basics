@@ -424,11 +424,11 @@ def evaluate(
             labels = labels.to(args.device)
             is_unknown = info['is_unknown']
             
-            # Compute energy scores
-            energy_scores = model.compute_energy_score(signals) # 看看返回了啥,为啥不需要输入class label
+            # Compute energy scores (use EMA network for evaluation)
+            energy_scores = model.compute_energy_score(signals, use_ema=True) 
             
             # Get class predictions (without rejection for now)
-            class_energies = model.compute_energy_score(signals, return_per_class=True)
+            class_energies = model.compute_energy_score(signals, return_per_class=True, use_ema=True)
             predictions = class_energies.argmin(dim=1)
             
             # Store results
@@ -463,11 +463,14 @@ def evaluate(
     # Create binary labels: 0 for known, 1 for unknown
     ood_labels = all_is_unknown.astype(int)
     
-    # Energy scores: higher means more likely OOD
-    auroc = roc_auc_score(ood_labels, all_energies) # 看看
+    # Energy scores: LESS NEGATIVE (closer to 0) means more likely OOD
+    # Since energies are negative, we need to negate them for AUROC calculation
+    # (AUROC expects higher scores for positive class, which is unknown/OOD)
+    auroc = roc_auc_score(ood_labels, -all_energies)  # Negate because less negative = more OOD
     
     # Compute AUPR (Area Under Precision-Recall curve)
-    precision, recall, _ = precision_recall_curve(ood_labels, all_energies) # 看看，返回的是列表？
+    # Again, negate energies since less negative = more OOD
+    precision, recall, _ = precision_recall_curve(ood_labels, -all_energies)
     aupr = auc(recall, precision)
     
     # Find optimal energy threshold if not provided
@@ -479,7 +482,8 @@ def evaluate(
         best_threshold = thresholds[0]
         
         for threshold in thresholds:
-            # Apply threshold
+            # Apply threshold - FIXED: energies are negative, so reject when GREATER than threshold
+            # (greater means less negative, closer to 0, which indicates OOD)
             predicted_unknown = all_energies > threshold
             
             # Compute F1 score
@@ -494,6 +498,7 @@ def evaluate(
         # 整个validation set 找到最大F1的threshold
     
     # Apply energy threshold for final predictions
+    # FIXED: Reject when energy is GREATER than threshold (less negative, closer to 0)
     rejected = all_energies > energy_threshold
     final_predictions = all_predictions.copy()
     final_predictions[rejected] = -1  # Mark as unknown
@@ -553,8 +558,9 @@ def evaluate(
                 ])
                 
                 # Calculate metrics for this unknown class
-                auroc_cls = roc_auc_score(combined_labels, combined_energies)
-                precision_cls, recall_cls, _ = precision_recall_curve(combined_labels, combined_energies)
+                # Negate energies for AUROC since less negative = more OOD
+                auroc_cls = roc_auc_score(combined_labels, -combined_energies)
+                precision_cls, recall_cls, _ = precision_recall_curve(combined_labels, -combined_energies)
                 aupr_cls = auc(recall_cls, precision_cls)
                 
                 # Detection accuracy at current threshold

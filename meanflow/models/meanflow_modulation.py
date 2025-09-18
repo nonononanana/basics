@@ -280,28 +280,26 @@ class MeanFlowModulation(nn.Module):
         # Compute energy losses for positive samples
         pos_energy_loss = torch.tensor(0.0, device=device)
         if lambda_pos > 0:
-            with torch.no_grad():
-                # Compute energy score for positive samples
-                pos_energies = self.compute_energy_score(x_pos, return_per_class=False)
+            # Compute energy score for positive samples using MAIN network for training
+            pos_energies = self.compute_energy_score(x_pos, return_per_class=False, use_ema=False)
             
-            # Energy scores are NEGATIVE (e.g., -0.5 to -0.01)
+            # Energy scores are NEGATIVE (e.g., -2.0 to -0.1)
             # For in-distribution (positive) samples, we want MORE negative values
             # L_pos = max(0, E(x) - margin_pos) where margin_pos should be negative
-            # Example: if E(x) = -0.1 and margin_pos = -0.3, loss = max(0, -0.1 - (-0.3)) = 0.2
+            # Example: if E(x) = -1.0 and margin_pos = -2.2, loss = max(0, -1.0 - (-2.2)) = 1.2
             # This penalizes samples that aren't negative enough
             pos_energy_loss = F.relu(pos_energies - margin_pos).mean()
         
         # Compute energy losses for negative samples
         neg_energy_loss = torch.tensor(0.0, device=device)
         if lambda_neg > 0 and x_neg is not None:
-            with torch.no_grad():
-                # Compute energy score for negative samples
-                neg_energies = self.compute_energy_score(x_neg, return_per_class=False)
+            # Compute energy score for negative samples using MAIN network for training
+            neg_energies = self.compute_energy_score(x_neg, return_per_class=False, use_ema=False)
             
-            # Energy scores are NEGATIVE (e.g., -0.5 to -0.01)
+            # Energy scores are NEGATIVE (e.g., -2.0 to -0.1)
             # For out-of-distribution (negative) samples, we want LESS negative values (closer to 0)
             # L_neg = max(0, margin_neg - E(x)) where margin_neg should be negative but closer to 0
-            # Example: if E(x) = -0.4 and margin_neg = -0.05, loss = max(0, -0.05 - (-0.4)) = 0.35
+            # Example: if E(x) = -2.0 and margin_neg = -1.5, loss = max(0, -1.5 - (-2.0)) = 0.5
             # This penalizes samples that are too negative (too similar to in-distribution)
             neg_energy_loss = F.relu(margin_neg - neg_energies).mean()
         
@@ -365,9 +363,10 @@ class MeanFlowModulation(nn.Module):
         return z_0
     
     def compute_energy_score(
-        self, 
+        self,
         x: torch.Tensor,
-        return_per_class: bool = False
+        return_per_class: bool = False,
+        use_ema: bool = True
     ) -> torch.Tensor:
         """
         Compute energy score for OOD detection
@@ -377,12 +376,16 @@ class MeanFlowModulation(nn.Module):
         Args:
             x: Input signal [batch_size, 2, 128]
             return_per_class: If True, return energy for each class
+            use_ema: If True, use EMA network (for evaluation), else use main network (for training)
         
         Returns:
             Energy scores [batch_size] or [batch_size, num_classes]
         """
         batch_size = x.shape[0]
         device = x.device
+        
+        # Select which network to use
+        net = self.net_ema if use_ema else self.net
         
         if return_per_class:
             # Compute energy for each class
@@ -393,7 +396,37 @@ class MeanFlowModulation(nn.Module):
                 class_labels = torch.full((batch_size,), class_idx, dtype=torch.long, device=device)
                 
                 # Compute reconstruction under this class assumption
-                with torch.no_grad():
+                # Only use no_grad for inference (when using EMA)
+                if use_ema:
+                    with torch.no_grad():
+                        # Sample noise
+                        e = torch.randn_like(x)
+                        
+                        # Use intermediate time for energy computation
+                        t = torch.full((batch_size,), 0.5, device=device)
+                        t_expanded = t.view(-1, 1, 1)
+                        
+                        # Interpolate
+                        z = (1 - t_expanded) * x + t_expanded * e
+                        
+                        # Predict velocity field
+                        u = net(
+                            z,
+                            (t, t),
+                            aug_cond=None,
+                            class_labels=class_labels
+                        )
+                        
+                        # Compute reconstruction
+                        x_recon = z - t_expanded * u
+                        
+                        # Compute reconstruction error as energy
+                        error = (x - x_recon)**2
+                        error = error.mean(dim=(1, 2))  # Mean over channel and time dimensions
+                        
+                        energies.append(error)
+                else:
+                    # Training mode - need gradients
                     # Sample noise
                     e = torch.randn_like(x)
                     
@@ -405,7 +438,7 @@ class MeanFlowModulation(nn.Module):
                     z = (1 - t_expanded) * x + t_expanded * e
                     
                     # Predict velocity field
-                    u = self.net_ema(
+                    u = net(
                         z,
                         (t, t),
                         aug_cond=None,
@@ -436,7 +469,7 @@ class MeanFlowModulation(nn.Module):
                 return energy_score
         else:
             # Compute minimum energy across all classes
-            energies = self.compute_energy_score(x, return_per_class=True)
+            energies = self.compute_energy_score(x, return_per_class=True, use_ema=use_ema)
             
             # Return negative log-sum-exp as energy score
             energy_score = -self.energy_temperature * torch.logsumexp(
@@ -473,8 +506,8 @@ class MeanFlowModulation(nn.Module):
             -class_energies / self.energy_temperature, dim=1
         )
         
-        # Reject samples with high energy (unknown classes)
-        # Normalize energy threshold based on data statistics
+        # Reject samples with high energy (less negative, closer to 0) for unknown classes
+        # Energy scores are negative: more negative = in-distribution, less negative = OOD
         reject_mask = energy_scores > energy_threshold
         predictions[reject_mask] = -1  # Mark as unknown
         

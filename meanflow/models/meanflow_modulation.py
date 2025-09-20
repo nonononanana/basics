@@ -58,6 +58,12 @@ class MeanFlowModulation(nn.Module):
         self.arcface_scale = arcface_scale
         self.energy_temperature = energy_temperature
         self.args = args
+
+        # Smooth hinge sharpness and per-class compute gating
+        # - smooth_hinge_beta controls how close to ReLU the softplus hinge is (higher = sharper)
+        # - per_class_compute_prob gates expensive per-class energy computations during training
+        self.smooth_hinge_beta = getattr(args, 'smooth_hinge_beta', 10.0)
+        self.per_class_compute_prob = getattr(args, 'per_class_compute_prob', 0.1)
         
         # Main network with class conditioning
         self.net = arch(**net_configs)
@@ -131,6 +137,14 @@ class MeanFlowModulation(nn.Module):
         if self.per_class_anchor:
             anchor_init = torch.zeros(num_classes)
             self.register_buffer('energy_anchor', anchor_init)
+
+    def smooth_hinge(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Smooth hinge penalty using softplus.
+        Approximates ReLU(x) while remaining differentiable everywhere.
+        """
+        beta = float(self.smooth_hinge_beta)
+        return F.softplus(x * beta) / beta
     
     def update_ema(self):
         """Update EMA networks"""
@@ -317,10 +331,14 @@ class MeanFlowModulation(nn.Module):
                 valid_labels = class_labels[valid_mask]
                 arcface_loss = self.arcface_loss(valid_features, valid_labels)
         
-        # Compute energy losses for positive samples
+        # Compute energy losses for positive samples\
+        pos_energies = None
+        neg_energies = None
         pos_energy_loss = torch.tensor(0.0, device=device)
         if lambda_pos > 0:
-            if self.use_per_class_margins and (class_labels >= 0).any():
+            # Gate expensive per-class energies on training batches; always on in eval
+            per_class_batch_active = (not self.training) or (torch.rand((), device=device) < self.per_class_compute_prob)
+            if self.use_per_class_margins and (class_labels >= 0).any() and per_class_batch_active:
                 # Per-class positive anchoring using true-class energy E_y(x)
                 per_class_E = self.compute_energy_score(x_pos, return_per_class=True, use_ema=False)
                 valid_mask = class_labels >= 0
@@ -333,14 +351,14 @@ class MeanFlowModulation(nn.Module):
                     else:
                         m_pos_global = -F.softplus(self.m_pos_raw)
                         m_pos_k = m_pos_global.expand_as(E_y)
-                    pos_energy_loss = F.leaky_relu(E_y - m_pos_k).mean()
+                    pos_energy_loss = self.smooth_hinge(E_y - m_pos_k).mean()
                 else:
                     pos_energy_loss = torch.tensor(0.0, device=device)
             else:
                 # Global anchoring on aggregated energy
                 pos_energies = self.compute_energy_score(x_pos, return_per_class=False, use_ema=False)
                 m_pos = -F.softplus(self.m_pos_raw) if self.use_per_class_margins else margin_pos
-                pos_energy_loss = F.leaky_relu(pos_energies - m_pos).mean()
+                pos_energy_loss = self.smooth_hinge(pos_energies - m_pos).mean()
         
         # Compute energy losses for negative samples
         neg_energy_loss = torch.tensor(0.0, device=device)
@@ -355,14 +373,14 @@ class MeanFlowModulation(nn.Module):
             else:
                 m_neg = margin_neg
             # Push negatives toward being less negative than m_neg (closer to 0)
-            neg_energy_loss = F.leaky_relu(m_neg - neg_energies).mean()
+            neg_energy_loss = self.smooth_hinge(m_neg - neg_energies).mean()
         
         # Compute soft ranking loss to encourage separation between positive and negative energies
         rank_loss = torch.tensor(0.0, device=device)
         if lambda_rank > 0 and x_neg is not None:
             # Unconditionally compute aggregated energies for rank loss (decoupled from pos/neg branches)
-            pos_energies_rank = self.compute_energy_score(x_pos, return_per_class=False, use_ema=False)
-            neg_energies_rank = self.compute_energy_score(x_neg, return_per_class=False, use_ema=False)
+            pos_energies_rank = pos_energies if pos_energies is not None else self.compute_energy_score(x_pos, return_per_class=False, use_ema=False)
+            neg_energies_rank = neg_energies if neg_energies is not None else self.compute_energy_score(x_neg, return_per_class=False, use_ema=False)
 
             # Pairwise soft ranking: encourage E_pos + Δ < E_neg
             pos_energies_expanded = pos_energies_rank.unsqueeze(1)  # [batch, 1]
@@ -381,34 +399,38 @@ class MeanFlowModulation(nn.Module):
         # Classification loss using per-class energies and learnable thresholds
         classification_loss = torch.tensor(0.0, device=device)
         if lambda_cls > 0 and (class_labels >= 0).any():
-            per_class_energies = self.compute_energy_score(x_pos, return_per_class=True, use_ema=False)
-            # logits = (tau_k - E_k) / T
-            temp = max(float(self.energy_temperature), 1e-6)
-            logits = (self.class_thresholds.view(1, -1) - per_class_energies) / temp
-            valid_mask = class_labels >= 0
-            if valid_mask.any():
-                classification_loss = F.cross_entropy(logits[valid_mask], class_labels[valid_mask])
+            per_class_batch_active = (not self.training) or (torch.rand((), device=device) < self.per_class_compute_prob)
+            if per_class_batch_active:
+                per_class_energies = self.compute_energy_score(x_pos, return_per_class=True, use_ema=False)
+                # logits = (tau_k - E_k) / T
+                temp = max(float(self.energy_temperature), 1e-6)
+                logits = (self.class_thresholds.view(1, -1) - per_class_energies) / temp
+                valid_mask = class_labels >= 0
+                if valid_mask.any():
+                    classification_loss = F.cross_entropy(logits[valid_mask], class_labels[valid_mask])
         
         # Optional per-class threshold anchor loss using EMA quantile targets
         anchor_loss = torch.tensor(0.0, device=device)
         if self.per_class_anchor and lambda_anchor > 0 and (class_labels >= 0).any():
-            # Compute per-class energies and update class-wise anchors using only true-class samples
-            per_class_E = self.compute_energy_score(x_pos, return_per_class=True, use_ema=False)
-            q = getattr(self.args, 'anchor_quantile', 0.2)
-            delta = getattr(self.args, 'anchor_delta', 0.2)
-            momentum = getattr(self.args, 'anchor_momentum', 0.9)
-            with torch.no_grad():
-                updated_anchor = self.energy_anchor.clone()
-                for k in range(self.num_classes):
-                    mask_k = (class_labels == k)
-                    if mask_k.any():
-                        energies_k = per_class_E[mask_k, k]
-                        batch_q_k = energies_k.quantile(q)
-                        updated_anchor[k] = momentum * self.energy_anchor[k] + (1 - momentum) * batch_q_k
-                self.energy_anchor.copy_(updated_anchor)
-            # Encourage tau_k to match anchor - delta
-            target = self.energy_anchor - delta
-            anchor_loss = F.smooth_l1_loss(self.class_thresholds, target.detach())
+            per_class_batch_active = (not self.training) or (torch.rand((), device=device) < self.per_class_compute_prob)
+            if per_class_batch_active:
+                # Compute per-class energies and update class-wise anchors using only true-class samples
+                per_class_E = self.compute_energy_score(x_pos, return_per_class=True, use_ema=False)
+                q = getattr(self.args, 'anchor_quantile', 0.2)
+                delta = getattr(self.args, 'anchor_delta', 0.2)
+                momentum = getattr(self.args, 'anchor_momentum', 0.9)
+                with torch.no_grad():
+                    updated_anchor = self.energy_anchor.clone()
+                    for k in range(self.num_classes):
+                        mask_k = (class_labels == k)
+                        if mask_k.any():
+                            energies_k = per_class_E[mask_k, k]
+                            batch_q_k = energies_k.quantile(q)
+                            updated_anchor[k] = momentum * self.energy_anchor[k] + (1 - momentum) * batch_q_k
+                    self.energy_anchor.copy_(updated_anchor)
+                # Encourage tau_k to match anchor - delta
+                target = self.energy_anchor - delta
+                anchor_loss = F.smooth_l1_loss(self.class_thresholds, target.detach())
 
         # Total loss with manual lambdas
         total_manual = (

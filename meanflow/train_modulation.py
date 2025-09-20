@@ -92,7 +92,7 @@ def parse_args():
                        help='Weight for per-class threshold anchor loss (quantile-target)')
     parser.add_argument('--margin_pos', type=float, default=-2.2,
                        help='Margin for positive energy (should be more negative, e.g., -2.2)')
-    parser.add_argument('--margin_neg', type=float, default=-1.5,
+    parser.add_argument('--margin_neg', type=float, default=-1.0,
                        help='Margin for negative energy (should be less negative, e.g., -1.5)')
     parser.add_argument('--rank_margin', type=float, default=0.5,
                        help='Margin delta for soft ranking loss')
@@ -895,7 +895,7 @@ def main():
         test_split=0.1,
         normalize=True,
         seed=args.seed,
-        precompute_negatives=True
+        precompute_negatives=False
     )
     
     # Create model

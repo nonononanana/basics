@@ -312,10 +312,10 @@ def train_epoch(
     
     for batch_idx, (pos_samples, neg_samples, labels, info) in progress_bar:
         # Move to device
-        pos_samples = pos_samples.to(args.device)
+        pos_samples = pos_samples.to(args.device, non_blocking=True)
         if neg_samples is not None:
-            neg_samples = neg_samples.to(args.device)
-        labels = labels.to(args.device)
+            neg_samples = neg_samples.to(args.device, non_blocking=True)
+        labels = labels.to(args.device, non_blocking=True)
         
         # Zero gradients
         optimizer.zero_grad()

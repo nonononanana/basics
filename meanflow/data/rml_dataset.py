@@ -232,6 +232,16 @@ class RML2016Dataset(Dataset):
         self.is_unknown = np.array(self.is_unknown, dtype=bool)
         self.original_modulations = np.array(self.original_modulations, dtype='U20')  # Unicode string array
         
+        # Build fast per-class indices for known classes (used for negative mixing)
+        # Known classes are labeled 0..num_classes-1; unknowns use -1
+        self.known_indices = np.where(self.labels >= 0)[0]
+        self.indices_by_class = {k: np.where(self.labels == k)[0] for k in range(self.num_classes)}
+        # Precompute other-class choices for each class for O(1) sampling
+        self.other_label_choices = {
+            k: np.array([j for j in range(self.num_classes) if j != k], dtype=np.int64)
+            for k in range(self.num_classes)
+        }
+
         # Normalize if requested
         if self.normalize:
             # Normalize each sample independently to [-1, 1] using vectorized operations
@@ -263,8 +273,8 @@ class RML2016Dataset(Dataset):
         
         # Process each sample
         for idx in range(n_samples):
-            # Generate one negative sample for this positive sample
-            neg_sample = self._create_negative_sample(self.samples[idx].copy())
+            # Generate one negative sample for this positive sample using mixing strategy
+            neg_sample = self._create_mixed_negative_sample(idx)
             self.negative_samples.append(neg_sample)
             
             # Log progress every 5000 samples
@@ -308,8 +318,8 @@ class RML2016Dataset(Dataset):
                 # Use pre-computed negative sample
                 negative_sample = self.negative_samples[idx].copy()
             else:
-                # Generate negative sample on-the-fly (slower but uses less memory)
-                negative_sample = self._create_negative_sample(positive_sample.copy())
+                # Generate mixed negative sample on-the-fly (70% current corrupted + 30% other class)
+                negative_sample = self._create_mixed_negative_sample(idx)
         else:
             # For test split, create a dummy negative sample (not used in evaluation but needed for collation)
             negative_sample = np.zeros_like(positive_sample)
@@ -327,6 +337,40 @@ class RML2016Dataset(Dataset):
         
         return positive_sample, negative_sample, label, info
     
+    def _create_mixed_negative_sample(self, idx: int):
+        """
+        70/30 strategy:
+          - 70%: create_negative_sample from current-class signal
+          - 30%: create_negative_sample from an other-class signal (OOD)
+        """
+        sample = self.samples[idx].copy()
+        label = int(self.labels[idx])
+        if np.random.rand() < 0.7:
+            return self._create_negative_sample(sample).astype(np.float32)
+        else:
+            other = self._sample_other_class_signal(label)
+            return self._create_negative_sample(other).astype(np.float32)
+
+    def _sample_other_class_signal(self, current_label: int):
+        """
+        Sample a signal from a different known class than current_label.
+        Falls back to any known sample if class buckets are empty (shouldn't happen).
+        """
+        # If current label unknown or single-class edge case, fallback to any known sample
+        if current_label < 0 or self.num_classes <= 1 or len(self.known_indices) == 0:
+            fallback_idx = int(np.random.choice(self.known_indices)) if len(self.known_indices) > 0 else 0
+            return self.samples[fallback_idx].copy()
+        # Choose a different class
+        choices = self.other_label_choices[current_label]
+        other_label = int(np.random.choice(choices)) if len(choices) > 0 else (current_label + 1) % self.num_classes
+        pool = self.indices_by_class.get(other_label, None)
+        if pool is None or len(pool) == 0:
+            # Fallback to any known sample
+            fallback_idx = int(np.random.choice(self.known_indices)) if len(self.known_indices) > 0 else 0
+            return self.samples[fallback_idx].copy()
+        other_idx = int(np.random.choice(pool))
+        return self.samples[other_idx].copy()
+
     def _create_negative_sample(self, sample):
         """
         Create a negative sample by applying heavy corruptions to deviate 
@@ -597,32 +641,42 @@ def get_rml_dataloaders(
     )
     
     # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
+    # Build DataLoader kwargs with optional prefetch and persistent workers
+    train_loader_kwargs = dict(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True  # Drop last incomplete batch for stable training
+        drop_last=True
     )
+    if num_workers and num_workers > 0:
+        train_loader_kwargs['prefetch_factor'] = 4
+        train_loader_kwargs['persistent_workers'] = True
+    train_loader = DataLoader(train_dataset, **train_loader_kwargs)
     
-    val_loader = DataLoader(
-        val_dataset,
+    val_loader_kwargs = dict(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False
     )
+    if num_workers and num_workers > 0:
+        val_loader_kwargs['prefetch_factor'] = 4
+        val_loader_kwargs['persistent_workers'] = True
+    val_loader = DataLoader(val_dataset, **val_loader_kwargs)
     
-    test_loader = DataLoader(
-        test_dataset,
+    test_loader_kwargs = dict(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False
     )
+    if num_workers and num_workers > 0:
+        test_loader_kwargs['prefetch_factor'] = 4
+        test_loader_kwargs['persistent_workers'] = True
+    test_loader = DataLoader(test_dataset, **test_loader_kwargs)
     
     logger.info(f"Created dataloaders - Train: {len(train_loader)} batches, Val: {len(val_loader)} batches, Test: {len(test_loader)} batches")
     

@@ -532,11 +532,11 @@ class ModulationUNet(nn.Module):
             class_emb = self.class_proj(class_emb)
             # Apply classifier-free guidance via a dedicated null embedding, not class 0
             if self.training and self.class_dropout > 0:
-                drop_mask = torch.rand(class_labels.shape[0], device=x.device) < self.class_dropout
+                drop_mask = (torch.rand(class_labels.shape[0], device=x.device) < self.class_dropout)
                 if drop_mask.any():
-                    null_add = self.null_class_time.unsqueeze(0).expand_as(class_emb)
                     class_emb = class_emb.clone()
-                    class_emb[drop_mask] = null_add[drop_mask]
+                    null_row = self.null_class_time.to(dtype=class_emb.dtype, device=class_emb.device).unsqueeze(0)
+                    class_emb[drop_mask] = null_row.expand(class_emb[drop_mask].shape[0], -1)
             # Add to time embedding
             time_emb = time_emb + class_emb
         

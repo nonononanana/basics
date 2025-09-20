@@ -156,6 +156,8 @@ def parse_args():
                        help='Enable uncertainty-based auto-weighting for losses')
     parser.add_argument('--per_class_anchor', action='store_true', default=True,
                        help='Enable per-class threshold anchor to energy quantiles')
+    parser.add_argument('--eval_with_synthetic_negatives', action='store_true', default=True,
+                       help='On validation/test, compute OOD metrics using synthetic negatives from the loader if available')
     parser.add_argument('--anchor_quantile', type=float, default=0.2,
                        help='Quantile of per-class energy to anchor thresholds to')
     parser.add_argument('--anchor_delta', type=float, default=0.2,
@@ -495,6 +497,20 @@ def evaluate(
             all_energies.append(energy_scores.cpu())
             all_is_unknown.append(is_unknown)  # from dataset
             all_original_modulations.extend(info.get('original_modulation', []))
+
+            # Optionally evaluate synthetic negatives as OOD for val/test
+            if args.eval_with_synthetic_negatives and neg_samples is not None:
+                neg_signals = neg_samples.to(args.device)
+                if args.use_learned_thresholds:
+                    _, neg_best_scores, _ = model.classify_with_learned_threshold(neg_signals, use_ema=True)
+                    neg_scores = -neg_best_scores  # higher = more OOD
+                else:
+                    neg_scores = model.compute_energy_score(neg_signals, use_ema=True)
+                # Append as unknowns
+                all_predictions.append(torch.full((neg_signals.shape[0],), -1, dtype=torch.long))
+                all_labels.append(torch.full((neg_signals.shape[0],), -1, dtype=torch.long))
+                all_energies.append(neg_scores.cpu())
+                all_is_unknown.append(torch.ones(neg_signals.shape[0], dtype=torch.bool))
             
             # Update progress bar with current stats
             eval_progress.set_postfix({

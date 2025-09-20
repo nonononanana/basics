@@ -86,11 +86,11 @@ def parse_args():
                        help='Weight for negative energy loss')
     parser.add_argument('--margin_pos', type=float, default=-2.2,
                        help='Margin for positive energy (should be more negative, e.g., -2.2)')
-    parser.add_argument('--margin_neg', type=float, default=-1.5,
+    parser.add_argument('--margin_neg', type=float, default=-0.2,
                        help='Margin for negative energy (should be less negative, e.g., -1.5)')
     
     # Training arguments
-    parser.add_argument('--batch_size', type=int, default=1024,
+    parser.add_argument('--batch_size', type=int, default=256,
                        help='Batch size for training')
     parser.add_argument('--eval_batch_size', type=int, default=2048,
                        help='Batch size for evaluation')
@@ -425,10 +425,10 @@ def evaluate(
             is_unknown = info['is_unknown']
             
             # Compute energy scores (use EMA network for evaluation)
-            energy_scores = model.compute_energy_score(signals, use_ema=True) 
+            energy_scores = model.compute_energy_score(signals, use_ema=False) 
             
             # Get class predictions (without rejection for now)
-            class_energies = model.compute_energy_score(signals, return_per_class=True, use_ema=True)
+            class_energies = model.compute_energy_score(signals, return_per_class=True, use_ema=False)
             predictions = class_energies.argmin(dim=1)
             
             # Store results

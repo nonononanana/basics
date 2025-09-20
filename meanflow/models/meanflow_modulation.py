@@ -192,11 +192,8 @@ class MeanFlowModulation(nn.Module):
         class_labels: torch.Tensor,
         aug_cond: Optional[torch.Tensor] = None,
         lambda_rec: float = 1.0,
-        lambda_arc: float = 5.0,
-        lambda_pos: float = 0.1,
-        lambda_neg: float = 0.5,
-        margin_pos: float = 0.1,
-        margin_neg: float = 0.5
+        lambda_arc: float = 0.5,
+        lambda_ood: float = 1.0
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass with loss computation including energy-based losses
@@ -208,10 +205,7 @@ class MeanFlowModulation(nn.Module):
             aug_cond: Optional augmentation conditioning
             lambda_rec: Weight for reconstruction loss
             lambda_arc: Weight for ArcFace loss
-            lambda_pos: Weight for positive energy loss
-            lambda_neg: Weight for negative energy loss
-            margin_pos: Margin for positive energy (should be small)
-            margin_neg: Margin for negative energy (should be large)
+            lambda_ood: Weight for OOD detection loss using negative samples
         
         Returns:
             Dictionary containing different loss components
@@ -277,46 +271,46 @@ class MeanFlowModulation(nn.Module):
                 valid_labels = class_labels[valid_mask]
                 arcface_loss = self.arcface_loss(valid_features, valid_labels)
         
-        # Compute energy losses for positive samples
-        pos_energy_loss = torch.tensor(0.0, device=device)
-        if lambda_pos > 0:
-            # Compute energy score for positive samples using MAIN network for training
-            pos_energies = self.compute_energy_score(x_pos, return_per_class=False, use_ema=False)
+        # Compute OOD detection loss using negative samples
+        ood_loss = torch.tensor(0.0, device=device)
+        if lambda_ood > 0 and x_neg is not None:
+            # Simple binary classification: positive samples are "real", negative samples are "fake"
+            # Get reconstruction errors for both positive and negative samples
             
-            # Energy scores are NEGATIVE (e.g., -2.0 to -0.1)
-            # For in-distribution (positive) samples, we want MORE negative values
-            # L_pos = max(0, E(x) - margin_pos) where margin_pos should be negative
-            # Example: if E(x) = -1.0 and margin_pos = -2.2, loss = max(0, -1.0 - (-2.2)) = 1.2
-            # This penalizes samples that aren't negative enough
-            pos_energy_loss = F.relu(pos_energies - margin_pos).mean()
-        
-        # Compute energy losses for negative samples
-        neg_energy_loss = torch.tensor(0.0, device=device)
-        if lambda_neg > 0 and x_neg is not None:
-            # Compute energy score for negative samples using MAIN network for training
-            neg_energies = self.compute_energy_score(x_neg, return_per_class=False, use_ema=False)
+            # Reconstruct positive samples (should have low reconstruction error)
+            pos_recon = self.reconstruct_sample(x_pos, class_labels, use_ema=False)
+            pos_recon_error = F.mse_loss(pos_recon, x_pos, reduction='none').mean(dim=(1, 2))
             
-            # Energy scores are NEGATIVE (e.g., -2.0 to -0.1)
-            # For out-of-distribution (negative) samples, we want LESS negative values (closer to 0)
-            # L_neg = max(0, margin_neg - E(x)) where margin_neg should be negative but closer to 0
-            # Example: if E(x) = -2.0 and margin_neg = -1.5, loss = max(0, -1.5 - (-2.0)) = 0.5
-            # This penalizes samples that are too negative (too similar to in-distribution)
-            neg_energy_loss = F.relu(margin_neg - neg_energies).mean()
+            # Reconstruct negative samples (should have high reconstruction error)
+            # Use random class labels for negative samples since they don't belong to any class
+            neg_class_labels = torch.randint(0, self.num_classes, (x_neg.shape[0],), device=device)
+            neg_recon = self.reconstruct_sample(x_neg, neg_class_labels, use_ema=False)
+            neg_recon_error = F.mse_loss(neg_recon, x_neg, reduction='none').mean(dim=(1, 2))
+            
+            # Binary classification loss: positive samples should have low error, negative high error
+            # Use margin-based loss to encourage separation
+            margin = 0.1  # Reconstruction error margin
+            
+            # Loss for positive samples: penalize if reconstruction error is too high
+            pos_loss = F.relu(pos_recon_error - margin).mean()
+            
+            # Loss for negative samples: penalize if reconstruction error is too low
+            neg_loss = F.relu(margin - neg_recon_error).mean()
+            
+            ood_loss = pos_loss + neg_loss
         
         # Total loss with weighted components
         total_loss = (
             lambda_rec * reconstruction_loss +
             lambda_arc * arcface_loss +
-            lambda_pos * pos_energy_loss +
-            lambda_neg * neg_energy_loss
+            lambda_ood * ood_loss
         )
         
         return {
             'total_loss': total_loss,
             'reconstruction_loss': reconstruction_loss,
             'arcface_loss': arcface_loss,
-            'pos_energy_loss': pos_energy_loss,
-            'neg_energy_loss': neg_energy_loss
+            'ood_loss': ood_loss
         }
     
     def sample(
@@ -361,6 +355,91 @@ class MeanFlowModulation(nn.Module):
         z_0 = z_1 - u
         
         return z_0
+    
+    def reconstruct_sample(
+        self,
+        x: torch.Tensor,
+        class_labels: torch.Tensor,
+        use_ema: bool = True
+    ) -> torch.Tensor:
+        """
+        Reconstruct a sample using the model
+        
+        Args:
+            x: Input signal [batch_size, 2, 128]
+            class_labels: Class labels for conditioning
+            use_ema: Whether to use EMA network
+            
+        Returns:
+            Reconstructed signal [batch_size, 2, 128]
+        """
+        net = self.net_ema if use_ema else self.net
+        batch_size = x.shape[0]
+        device = x.device
+        
+        # Add noise and then reconstruct
+        e = torch.randn_like(x)
+        t = torch.full((batch_size,), 0.5, device=device)  # Use middle timestep
+        t_expanded = t.view(-1, 1, 1)
+        
+        # Interpolate between data and noise
+        z = (1 - t_expanded) * x + t_expanded * e
+        
+        # Predict velocity
+        with torch.no_grad() if use_ema else torch.enable_grad():
+            u = net(z, (t, t), aug_cond=None, class_labels=class_labels)
+            
+            # Reconstruct by removing predicted noise
+            x_recon = z - t_expanded * u
+        
+        return x_recon
+    
+    def classify_and_detect_ood(
+        self,
+        x: torch.Tensor,
+        use_ema: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Classify samples and compute OOD detection scores
+        
+        Args:
+            x: Input signals [batch_size, 2, 128]
+            use_ema: Whether to use EMA network
+            
+        Returns:
+            predictions: Class predictions [batch_size]
+            ood_scores: OOD detection scores (higher = more likely OOD) [batch_size]
+        """
+        batch_size = x.shape[0]
+        device = x.device
+        
+        # Compute reconstruction error for each class
+        class_errors = []
+        
+        for class_idx in range(self.num_classes):
+            class_labels = torch.full((batch_size,), class_idx, dtype=torch.long, device=device)
+            
+            # Reconstruct using this class
+            x_recon = self.reconstruct_sample(x, class_labels, use_ema=use_ema)
+            
+            # Compute reconstruction error
+            recon_error = F.mse_loss(x_recon, x, reduction='none').mean(dim=(1, 2))
+            class_errors.append(recon_error)
+        
+        # Stack errors for all classes [batch_size, num_classes]
+        class_errors = torch.stack(class_errors, dim=1)
+        
+        # Best class prediction (lowest reconstruction error)
+        predictions = class_errors.argmin(dim=1)
+        
+        # OOD score: minimum reconstruction error (lower error = more in-distribution)
+        # We want higher scores for OOD, so we use negative of min error or some transformation
+        min_errors = class_errors.min(dim=1)[0]
+        
+        # Simple OOD score: use reconstruction error directly (higher = more OOD)
+        ood_scores = min_errors
+        
+        return predictions, ood_scores
     
     def compute_energy_score(
         self,

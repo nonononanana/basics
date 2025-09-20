@@ -75,19 +75,13 @@ def parse_args():
     parser.add_argument('--arcface_scale', type=float, default=15.0,
                        help='ArcFace scale parameter')
     
-    # Energy loss hyperparameters
+    # Loss hyperparameters
     parser.add_argument('--lambda_rec', type=float, default=1.0,
                        help='Weight for reconstruction loss')
     parser.add_argument('--lambda_arc', type=float, default=0.5,
                        help='Weight for ArcFace loss')
-    parser.add_argument('--lambda_pos', type=float, default=0.5,
-                       help='Weight for positive energy loss')
-    parser.add_argument('--lambda_neg', type=float, default=0.5,
-                       help='Weight for negative energy loss')
-    parser.add_argument('--margin_pos', type=float, default=-2.2,
-                       help='Margin for positive energy (should be more negative, e.g., -2.2)')
-    parser.add_argument('--margin_neg', type=float, default=-0.2,
-                       help='Margin for negative energy (should be less negative, e.g., -1.5)')
+    parser.add_argument('--lambda_ood', type=float, default=1.0,
+                       help='Weight for OOD detection loss using negative samples')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=256,
@@ -136,6 +130,8 @@ def parse_args():
                        help='Temperature for energy scoring')
     parser.add_argument('--energy_threshold', type=float, default=None,
                        help='Energy threshold for OOD detection (auto-tuned if None)')
+    parser.add_argument('--target_fpr', type=float, default=0.05,
+                       help='Target false positive rate for threshold tuning on validation')
     
     # System arguments
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
@@ -261,8 +257,7 @@ def train_epoch(
     total_loss = 0.0
     reconstruction_loss = 0.0
     arcface_loss = 0.0
-    pos_energy_loss = 0.0
-    neg_energy_loss = 0.0
+    ood_loss = 0.0
     num_batches = 0
     
     # Training loop with progress bar
@@ -294,10 +289,7 @@ def train_epoch(
                     aug_cond=None,
                     lambda_rec=args.lambda_rec,
                     lambda_arc=args.lambda_arc,
-                    lambda_pos=args.lambda_pos,
-                    lambda_neg=args.lambda_neg,
-                    margin_pos=args.margin_pos,
-                    margin_neg=args.margin_neg
+                    lambda_ood=args.lambda_ood
                 )
                 loss = loss_dict['total_loss']
             
@@ -321,10 +313,7 @@ def train_epoch(
                 aug_cond=None,
                 lambda_rec=args.lambda_rec,
                 lambda_arc=args.lambda_arc,
-                lambda_pos=args.lambda_pos,
-                lambda_neg=args.lambda_neg,
-                margin_pos=args.margin_pos,
-                margin_neg=args.margin_neg
+                lambda_ood=args.lambda_ood
             )
             loss = loss_dict['total_loss']
             
@@ -346,8 +335,7 @@ def train_epoch(
         reconstruction_loss += loss_dict['reconstruction_loss'].item()
         if args.use_arcface:
             arcface_loss += loss_dict['arcface_loss'].item()
-        pos_energy_loss += loss_dict['pos_energy_loss'].item()
-        neg_energy_loss += loss_dict['neg_energy_loss'].item()
+        ood_loss += loss_dict['ood_loss'].item()
         num_batches += 1
         
         # Learning rate scheduler step
@@ -360,11 +348,9 @@ def train_epoch(
         progress_bar.set_postfix({
             'Loss': f'{current_loss:.4f}',
             'Rec': f'{(reconstruction_loss / num_batches):.4f}',
-            'Pos': f'{(pos_energy_loss / num_batches):.4f}',
-            'Neg': f'{(neg_energy_loss / num_batches):.4f}',
+            'OOD': f'{(ood_loss / num_batches):.4f}',
             'lr': f'{current_lr:.2e}',
             'Arc': f'{(arcface_loss / num_batches):.4f}' if args.use_arcface else '0.0000',
-
         })
     
     # Compute average metrics
@@ -372,8 +358,7 @@ def train_epoch(
         'train/total_loss': total_loss / num_batches,
         'train/reconstruction_loss': reconstruction_loss / num_batches,
         'train/arcface_loss': arcface_loss / num_batches if args.use_arcface else 0.0,
-        'train/pos_energy_loss': pos_energy_loss / num_batches,
-        'train/neg_energy_loss': neg_energy_loss / num_batches,
+        'train/ood_loss': ood_loss / num_batches,
         'train/learning_rate': optimizer.param_groups[0]['lr']
     }
     
@@ -424,17 +409,14 @@ def evaluate(
             labels = labels.to(args.device)
             is_unknown = info['is_unknown']
             
-            # Compute energy scores (use EMA network for evaluation)
-            energy_scores = model.compute_energy_score(signals, use_ema=False) 
-            
-            # Get class predictions (without rejection for now)
-            class_energies = model.compute_energy_score(signals, return_per_class=True, use_ema=False)
-            predictions = class_energies.argmin(dim=1)
+            # Get class predictions using reconstruction error
+            class_predictions, ood_scores = model.classify_and_detect_ood(signals, use_ema=True)
+            predictions = class_predictions
             
             # Store results
             all_predictions.append(predictions.cpu())
             all_labels.append(labels.cpu())  # from dataset
-            all_energies.append(energy_scores.cpu())
+            all_energies.append(ood_scores.cpu())  # Now using OOD scores instead of energy
             all_is_unknown.append(is_unknown)  # from dataset
             all_original_modulations.extend(info.get('original_modulation', []))
             
@@ -459,46 +441,65 @@ def evaluate(
     known_labels = all_labels[known_mask]
     closed_set_accuracy = (known_predictions == known_labels).mean()  # 注： 与OOD阈值无关，假装数据集只有known classes
     
-    # Compute AUROC for OOD detection
+    # Compute AUROC for OOD detection (only if we have unknown samples)
     # Create binary labels: 0 for known, 1 for unknown
     ood_labels = all_is_unknown.astype(int)
     
-    # Energy scores: LESS NEGATIVE (closer to 0) means more likely OOD
-    # Since energies are negative, we need to negate them for AUROC calculation
-    # (AUROC expects higher scores for positive class, which is unknown/OOD)
-    auroc = roc_auc_score(ood_labels, -all_energies)  # Negate because less negative = more OOD
+    # Check if we have both known and unknown samples (for AUROC computation)
+    has_unknown = unknown_mask.sum() > 0
+    has_known = known_mask.sum() > 0
     
-    # Compute AUPR (Area Under Precision-Recall curve)
-    # Again, negate energies since less negative = more OOD
-    precision, recall, _ = precision_recall_curve(ood_labels, -all_energies)
-    aupr = auc(recall, precision)
+    if has_unknown and has_known:
+        # OOD scores: HIGHER scores mean more likely OOD (opposite of energy)
+        # Use scores directly for AUROC calculation
+        auroc = roc_auc_score(ood_labels, all_energies)  # Higher score = more OOD
+        
+        # Compute AUPR (Area Under Precision-Recall curve)
+        precision, recall, _ = precision_recall_curve(ood_labels, all_energies)
+        aupr = auc(recall, precision)
+    else:
+        # No unknown samples (e.g., validation set) - AUROC/AUPR undefined
+        auroc = np.nan
+        aupr = np.nan
+        logger.info('No unknown samples in dataset - AUROC/AUPR not computed')
     
     # Find optimal energy threshold if not provided
     if energy_threshold is None:
-        # Use validation set to find threshold that maximizes F1 score
-        
-        thresholds = np.percentile(all_energies, np.linspace(0, 100, 100))
-        best_f1 = 0
-        best_threshold = thresholds[0]
-        
-        for threshold in thresholds:
-            # Apply threshold - FIXED: energies are negative, so reject when GREATER than threshold
-            # (greater means less negative, closer to 0, which indicates OOD)
-            predicted_unknown = all_energies > threshold
+        if has_unknown:
+            # Test set: find threshold that maximizes F1 score
+            thresholds = np.percentile(all_energies, np.linspace(0, 100, 100))
+            best_f1 = 0
+            best_threshold = thresholds[0]
             
-            # Compute F1 score
-            f1 = f1_score(ood_labels, predicted_unknown)
+            for threshold in thresholds:
+                # Apply threshold - higher OOD scores mean more likely unknown
+                predicted_unknown = all_energies > threshold
+                
+                # Compute F1 score
+                f1 = f1_score(ood_labels, predicted_unknown)
+                
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_threshold = threshold
             
-            if f1 > best_f1:
-                best_f1 = f1
-                best_threshold = threshold
-        
-        energy_threshold = best_threshold
-        logger.info(f'Optimal energy threshold: {energy_threshold:.4f} (F1: {best_f1:.4f})')
-        # 整个validation set 找到最大F1的threshold
+            energy_threshold = best_threshold
+            logger.info(f'Optimal energy threshold: {energy_threshold:.4f} (F1: {best_f1:.4f})')
+        else:
+            # Validation set: use target FPR on known samples only
+            if known_mask.sum() > 0:
+                # Set threshold to achieve target FPR (e.g., 5%)
+                target_fpr = getattr(args, 'target_fpr', 0.05)
+                # Find the (100 - target_fpr*100) percentile of known OOD scores
+                percentile = (1.0 - target_fpr) * 100
+                energy_threshold = np.percentile(all_energies[known_mask], percentile)
+                logger.info(f'Energy threshold set for {target_fpr:.1%} FPR: {energy_threshold:.4f}')
+            else:
+                # Fallback to median
+                energy_threshold = np.median(all_energies)
+                logger.info(f'Using median energy as threshold: {energy_threshold:.4f}')
     
-    # Apply energy threshold for final predictions
-    # FIXED: Reject when energy is GREATER than threshold (less negative, closer to 0)
+    # Apply threshold for final predictions
+    # Reject when OOD score is GREATER than threshold (higher score = more likely OOD)
     rejected = all_energies > energy_threshold
     final_predictions = all_predictions.copy()
     final_predictions[rejected] = -1  # Mark as unknown
@@ -558,9 +559,9 @@ def evaluate(
                 ])
                 
                 # Calculate metrics for this unknown class
-                # Negate energies for AUROC since less negative = more OOD
-                auroc_cls = roc_auc_score(combined_labels, -combined_energies)
-                precision_cls, recall_cls, _ = precision_recall_curve(combined_labels, -combined_energies)
+                # Higher OOD scores = more OOD
+                auroc_cls = roc_auc_score(combined_labels, combined_energies)
+                precision_cls, recall_cls, _ = precision_recall_curve(combined_labels, combined_energies)
                 aupr_cls = auc(recall_cls, precision_cls)
                 
                 # Detection accuracy at current threshold
@@ -589,8 +590,11 @@ def evaluate(
     # TKR = TK / K = (Known samples not rejected) / Total known samples
     tkr = (known_mask & ~rejected).sum() / known_mask.sum() if known_mask.sum() > 0 else 0
     
-    # Calculate F1-score for OOD detection
-    ood_f1 = f1_score(ood_labels, rejected)
+    # Calculate F1-score for OOD detection (only if we have unknown samples)
+    if has_unknown:
+        ood_f1 = f1_score(ood_labels, rejected)
+    else:
+        ood_f1 = 0.0  # No unknowns, F1 undefined
 
     # Compile metrics
     metrics = {
@@ -768,7 +772,7 @@ def main():
     
     # Resume from checkpoint if specified
     start_epoch = 0
-    best_auroc = 0.0
+    best_metric = 0.0  # Will track best closed_set_accuracy for validation
     energy_threshold = args.energy_threshold
     
     if args.resume:
@@ -849,13 +853,13 @@ def main():
                 val_metrics_wandb = {k.replace('eval/', 'val/'): v for k, v in val_metrics.items()}
                 wandb.log(val_metrics_wandb, step=epoch)
             
-            # Save checkpoint based on validation performance
-            is_best = val_metrics['eval/auroc'] > best_auroc
+            # Save checkpoint based on validation performance (use closed_set_accuracy since no unknowns in val)
+            is_best = val_metrics['eval/closed_set_accuracy'] > best_metric
             if is_best:
-                best_auroc = val_metrics['eval/auroc']
-                logger.info(f'New best validation AUROC: {best_auroc:.4f}')
+                best_metric = val_metrics['eval/closed_set_accuracy']
+                logger.info(f'New best validation closed-set accuracy: {best_metric:.4f}')
                 # Update progress bar to show best performance
-                epoch_progress.set_description(f'Training Progress (Best AUROC: {best_auroc:.4f})')
+                epoch_progress.set_description(f'Training Progress (Best Acc: {best_metric:.4f})')
             
             save_checkpoint(
                 model=model,

@@ -360,34 +360,23 @@ class MeanFlowModulation(nn.Module):
         # Compute soft ranking loss to encourage separation between positive and negative energies
         rank_loss = torch.tensor(0.0, device=device)
         if lambda_rank > 0 and x_neg is not None:
-            # We want E_pos < E_neg (more negative for positive, less negative for negative)
-            # L_rank = (1/β) * log(1 + exp(β * (E_p - E_n + Δ)))
-            # where Δ is the margin (positive value)
-            
-            # Get energies (reuse if already computed, otherwise compute)
-            if lambda_pos == 0:
-                pos_energies = self.compute_energy_score(x_pos, return_per_class=False, use_ema=False)
-            if lambda_neg == 0:
-                neg_energies = self.compute_energy_score(x_neg, return_per_class=False, use_ema=False)
-            
-            # Compute pairwise ranking loss
-            # We want pos_energies to be more negative than neg_energies by at least rank_margin
-            # Reshape for pairwise computation
-            pos_energies_expanded = pos_energies.unsqueeze(1)  # [batch, 1]
-            neg_energies_expanded = neg_energies.unsqueeze(0)  # [1, batch]
-            
-            # Compute soft ranking loss for all pairs
-            # E_p - E_n + Δ where we want this to be negative
+            # Unconditionally compute aggregated energies for rank loss (decoupled from pos/neg branches)
+            pos_energies_rank = self.compute_energy_score(x_pos, return_per_class=False, use_ema=False)
+            neg_energies_rank = self.compute_energy_score(x_neg, return_per_class=False, use_ema=False)
+
+            # Pairwise soft ranking: encourage E_pos + Δ < E_neg
+            pos_energies_expanded = pos_energies_rank.unsqueeze(1)  # [batch, 1]
+            neg_energies_expanded = neg_energies_rank.unsqueeze(0)  # [1, batch]
+
             if self.use_per_class_margins:
                 m_gap = F.softplus(self.m_gap_raw)  # positive gap
                 margin_for_rank = m_gap.detach()  # keep rank margin stable
             else:
                 margin_for_rank = torch.tensor(rank_margin, device=device)
             energy_diff = pos_energies_expanded - neg_energies_expanded + margin_for_rank
-            
-            # Soft ranking loss: (1/β) * log(1 + exp(β * energy_diff))
+
             rank_loss = (1.0 / rank_beta) * torch.log(1 + torch.exp(rank_beta * energy_diff))
-            rank_loss = rank_loss.mean()  # Average over all pairs
+            rank_loss = rank_loss.mean()
 
         # Classification loss using per-class energies and learnable thresholds
         classification_loss = torch.tensor(0.0, device=device)

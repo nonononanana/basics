@@ -165,6 +165,11 @@ def parse_args():
     parser.add_argument('--anchor_momentum', type=float, default=0.9,
                        help='EMA momentum for per-class quantile tracking')
     
+    # Preset modes (override related flags/weights)
+    parser.add_argument('--mode', type=str, default='full_auto',
+                       choices=['custom', 'baseline', 'thresholds', 'margins', 'full_auto'],
+                       help='Preset configuration: custom (no override), baseline, thresholds, margins, full_auto')
+    
     # System arguments
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                        help='Device to use for training')
@@ -803,6 +808,59 @@ def main():
     """Main training function"""
     # Parse arguments
     args = parse_args()
+    
+    # Apply mode presets
+    if args.mode != 'custom':
+        if args.mode == 'baseline':
+            args.use_learned_thresholds = False
+            args.use_learned_margins = False
+            args.auto_lambda = False
+            args.per_class_anchor = False
+            # classic weights
+            args.lambda_rec = 1.0
+            args.lambda_arc = 0.2 if args.use_arcface else 0.0
+            args.lambda_pos = 0.3
+            args.lambda_neg = 0.2
+            args.lambda_rank = 0.1
+            args.lambda_cls = 0.0
+            args.lambda_anchor = 0.0
+        elif args.mode == 'thresholds':
+            args.use_learned_thresholds = True
+            args.use_learned_margins = False
+            args.auto_lambda = False
+            args.per_class_anchor = True
+            args.lambda_rec = 1.0
+            args.lambda_arc = 0.2 if args.use_arcface else 0.0
+            args.lambda_pos = 0.3
+            args.lambda_neg = 0.2
+            args.lambda_rank = 0.1
+            args.lambda_cls = 0.1
+            args.lambda_anchor = 0.1
+        elif args.mode == 'margins':
+            args.use_learned_thresholds = False
+            args.use_learned_margins = True
+            args.auto_lambda = False
+            args.per_class_anchor = False
+            args.lambda_rec = 1.0
+            args.lambda_arc = 0.2 if args.use_arcface else 0.0
+            args.lambda_pos = 0.3
+            args.lambda_neg = 0.2
+            args.lambda_rank = 0.1
+            args.lambda_cls = 0.0
+            args.lambda_anchor = 0.0
+        elif args.mode == 'full_auto':
+            args.use_learned_thresholds = True
+            args.use_learned_margins = True
+            args.auto_lambda = True
+            args.per_class_anchor = True
+            # λ magnitudes are ignored by auto_lambda, but keep them > 0 to include terms
+            args.lambda_rec = 1.0
+            args.lambda_arc = 0.2 if args.use_arcface else 0.0
+            args.lambda_pos = 0.3
+            args.lambda_neg = 0.2
+            args.lambda_rank = 0.1
+            args.lambda_cls = 0.1
+            args.lambda_anchor = 0.1
     
     # Create output directory
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)

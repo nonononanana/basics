@@ -382,6 +382,8 @@ class ModulationUNet(nn.Module):
         # Class embedding
         self.class_embed = nn.Embedding(num_classes, class_embed_dim)
         self.class_proj = Linear(class_embed_dim, time_embed_dim)
+        # Dedicated null-class time embedding to avoid colliding with real class 0
+        self.null_class_time = nn.Parameter(torch.zeros(time_embed_dim))
         
         # Initial convolution
         self.init_conv = Conv1d(
@@ -525,17 +527,16 @@ class ModulationUNet(nn.Module):
         
         # Add class embedding if provided
         if class_labels is not None:
-            # Apply class dropout during training
-            if self.training and self.class_dropout > 0:
-                # Randomly drop class labels
-                drop_mask = torch.rand(class_labels.shape[0], device=x.device) < self.class_dropout
-                class_labels = class_labels.clone()
-                class_labels[drop_mask] = 0  # Use class 0 as "no class" token
-            
-            # Get class embeddings
+            # Compute class-conditioned contribution
             class_emb = self.class_embed(class_labels)
             class_emb = self.class_proj(class_emb)
-            
+            # Apply classifier-free guidance via a dedicated null embedding, not class 0
+            if self.training and self.class_dropout > 0:
+                drop_mask = torch.rand(class_labels.shape[0], device=x.device) < self.class_dropout
+                if drop_mask.any():
+                    null_add = self.null_class_time.unsqueeze(0).expand_as(class_emb)
+                    class_emb = class_emb.clone()
+                    class_emb[drop_mask] = null_add[drop_mask]
             # Add to time embedding
             time_emb = time_emb + class_emb
         

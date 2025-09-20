@@ -68,20 +68,36 @@ def parse_args():
                        help='Weight decay for regularization')
     parser.add_argument('--class_dropout', type=float, default=0.1,
                        help='Class dropout for classifier-free guidance')
-    parser.add_argument('--use_arcface', action='store_true',
+    parser.add_argument('--use_arcface', action='store_true', default=True,
                        help='Use ArcFace loss for better class separation')
     parser.add_argument('--arcface_margin', type=float, default=0.5,
                        help='ArcFace margin parameter')
     parser.add_argument('--arcface_scale', type=float, default=15.0,
                        help='ArcFace scale parameter')
     
-    # Loss hyperparameters
+    # Energy loss hyperparameters
     parser.add_argument('--lambda_rec', type=float, default=1.0,
                        help='Weight for reconstruction loss')
     parser.add_argument('--lambda_arc', type=float, default=0.5,
                        help='Weight for ArcFace loss')
-    parser.add_argument('--lambda_ood', type=float, default=1.0,
-                       help='Weight for OOD detection loss using negative samples')
+    parser.add_argument('--lambda_pos', type=float, default=0.5,
+                       help='Weight for positive energy loss')
+    parser.add_argument('--lambda_neg', type=float, default=0.5,
+                       help='Weight for negative energy loss')
+    parser.add_argument('--lambda_rank', type=float, default=0.1,
+                       help='Weight for soft ranking loss')
+    parser.add_argument('--lambda_cls', type=float, default=0.1,
+                       help='Weight for classification loss via per-class energies and learnable thresholds')
+    parser.add_argument('--lambda_anchor', type=float, default=0.1,
+                       help='Weight for per-class threshold anchor loss (quantile-target)')
+    parser.add_argument('--margin_pos', type=float, default=-2.2,
+                       help='Margin for positive energy (should be more negative, e.g., -2.2)')
+    parser.add_argument('--margin_neg', type=float, default=-1.5,
+                       help='Margin for negative energy (should be less negative, e.g., -1.5)')
+    parser.add_argument('--rank_margin', type=float, default=0.5,
+                       help='Margin delta for soft ranking loss')
+    parser.add_argument('--rank_beta', type=float, default=10.0,
+                       help='Beta parameter for soft ranking loss')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=256,
@@ -100,7 +116,7 @@ def parse_args():
                        help='Additional EMA decay rates')
     parser.add_argument('--grad_clip', type=float, default=1.0,
                        help='Gradient clipping value')
-    parser.add_argument('--mixed_precision', action='store_true',
+    parser.add_argument('--mixed_precision', action='store_true', default=True,
                        help='Use mixed precision training')
     
     # Mean flow specific arguments
@@ -132,6 +148,20 @@ def parse_args():
                        help='Energy threshold for OOD detection (auto-tuned if None)')
     parser.add_argument('--target_fpr', type=float, default=0.05,
                        help='Target false positive rate for threshold tuning on validation')
+    parser.add_argument('--use_learned_thresholds', action='store_true', default=True,
+                       help='Use learned per-class thresholds for classification and OOD rejection during evaluation')
+    parser.add_argument('--use_learned_margins', action='store_true', default=True,
+                       help='Use constrained learned margins for energy losses (m_pos,m_neg)')
+    parser.add_argument('--auto_lambda', action='store_true', default=True,
+                       help='Enable uncertainty-based auto-weighting for losses')
+    parser.add_argument('--per_class_anchor', action='store_true', default=True,
+                       help='Enable per-class threshold anchor to energy quantiles')
+    parser.add_argument('--anchor_quantile', type=float, default=0.2,
+                       help='Quantile of per-class energy to anchor thresholds to')
+    parser.add_argument('--anchor_delta', type=float, default=0.2,
+                       help='Subtract delta from quantile for target threshold')
+    parser.add_argument('--anchor_momentum', type=float, default=0.9,
+                       help='EMA momentum for per-class quantile tracking')
     
     # System arguments
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
@@ -257,7 +287,11 @@ def train_epoch(
     total_loss = 0.0
     reconstruction_loss = 0.0
     arcface_loss = 0.0
-    ood_loss = 0.0
+    pos_energy_loss = 0.0
+    neg_energy_loss = 0.0
+    rank_loss = 0.0
+    classification_loss = 0.0
+    anchor_loss = 0.0
     num_batches = 0
     
     # Training loop with progress bar
@@ -289,7 +323,15 @@ def train_epoch(
                     aug_cond=None,
                     lambda_rec=args.lambda_rec,
                     lambda_arc=args.lambda_arc,
-                    lambda_ood=args.lambda_ood
+                    lambda_pos=args.lambda_pos,
+                    lambda_neg=args.lambda_neg,
+                    lambda_rank=args.lambda_rank,
+                    lambda_cls=args.lambda_cls,
+                    lambda_anchor=args.lambda_anchor,
+                    margin_pos=args.margin_pos,
+                    margin_neg=args.margin_neg,
+                    rank_margin=args.rank_margin,
+                    rank_beta=args.rank_beta
                 )
                 loss = loss_dict['total_loss']
             
@@ -313,7 +355,15 @@ def train_epoch(
                 aug_cond=None,
                 lambda_rec=args.lambda_rec,
                 lambda_arc=args.lambda_arc,
-                lambda_ood=args.lambda_ood
+                lambda_pos=args.lambda_pos,
+                lambda_neg=args.lambda_neg,
+                lambda_rank=args.lambda_rank,
+                lambda_cls=args.lambda_cls,
+                lambda_anchor=args.lambda_anchor,
+                margin_pos=args.margin_pos,
+                margin_neg=args.margin_neg,
+                rank_margin=args.rank_margin,
+                rank_beta=args.rank_beta
             )
             loss = loss_dict['total_loss']
             
@@ -335,7 +385,14 @@ def train_epoch(
         reconstruction_loss += loss_dict['reconstruction_loss'].item()
         if args.use_arcface:
             arcface_loss += loss_dict['arcface_loss'].item()
-        ood_loss += loss_dict['ood_loss'].item()
+        pos_energy_loss += loss_dict['pos_energy_loss'].item()
+        neg_energy_loss += loss_dict['neg_energy_loss'].item()
+        if 'rank_loss' in loss_dict:
+            rank_loss += loss_dict['rank_loss'].item()
+        if 'classification_loss' in loss_dict:
+            classification_loss += loss_dict['classification_loss'].item()
+        if 'anchor_loss' in loss_dict:
+            anchor_loss += loss_dict['anchor_loss'].item()
         num_batches += 1
         
         # Learning rate scheduler step
@@ -348,9 +405,11 @@ def train_epoch(
         progress_bar.set_postfix({
             'Loss': f'{current_loss:.4f}',
             'Rec': f'{(reconstruction_loss / num_batches):.4f}',
-            'OOD': f'{(ood_loss / num_batches):.4f}',
+            'Pos': f'{(pos_energy_loss / num_batches):.4f}',
+            'Neg': f'{(neg_energy_loss / num_batches):.4f}',
             'lr': f'{current_lr:.2e}',
             'Arc': f'{(arcface_loss / num_batches):.4f}' if args.use_arcface else '0.0000',
+
         })
     
     # Compute average metrics
@@ -358,9 +417,15 @@ def train_epoch(
         'train/total_loss': total_loss / num_batches,
         'train/reconstruction_loss': reconstruction_loss / num_batches,
         'train/arcface_loss': arcface_loss / num_batches if args.use_arcface else 0.0,
-        'train/ood_loss': ood_loss / num_batches,
+        'train/pos_energy_loss': pos_energy_loss / num_batches,
+        'train/neg_energy_loss': neg_energy_loss / num_batches,
+        'train/rank_loss': rank_loss / num_batches,
         'train/learning_rate': optimizer.param_groups[0]['lr']
     }
+    if args.lambda_cls > 0:
+        metrics['train/classification_loss'] = classification_loss / num_batches
+    if args.lambda_anchor > 0:
+        metrics['train/anchor_loss'] = anchor_loss / num_batches
     
     return metrics
 
@@ -393,6 +458,7 @@ def evaluate(
     all_energies = []
     all_is_unknown = []
     all_original_modulations = []  # Track original modulation for per-class metrics
+    all_best_scores = []  # used when args.use_learned_thresholds
     
     # Evaluation loop with progress bar
     eval_progress = tqdm(
@@ -409,14 +475,24 @@ def evaluate(
             labels = labels.to(args.device)
             is_unknown = info['is_unknown']
             
-            # Get class predictions using reconstruction error
-            class_predictions, ood_scores = model.classify_and_detect_ood(signals, use_ema=True)
-            predictions = class_predictions
+            # Compute class energies and predictions without rejection
+            class_energies = model.compute_energy_score(signals, return_per_class=True, use_ema=True)
+            predictions = class_energies.argmin(dim=1)
+
+            # Compute OOD energy-like scores
+            if args.use_learned_thresholds:
+                # Use learned thresholds to form scores but don't use their rejection yet
+                _, best_scores, _ = model.classify_with_learned_threshold(signals, use_ema=True)
+                # Higher values should mean more OOD for AUROC/AUPR, so negate best_scores
+                energy_scores = -best_scores
+                all_best_scores.append(best_scores.cpu())
+            else:
+                energy_scores = model.compute_energy_score(signals, use_ema=True)
             
             # Store results
             all_predictions.append(predictions.cpu())
             all_labels.append(labels.cpu())  # from dataset
-            all_energies.append(ood_scores.cpu())  # Now using OOD scores instead of energy
+            all_energies.append(energy_scores.cpu())
             all_is_unknown.append(is_unknown)  # from dataset
             all_original_modulations.extend(info.get('original_modulation', []))
             
@@ -431,6 +507,10 @@ def evaluate(
     all_energies = torch.cat(all_energies).numpy()
     all_is_unknown = torch.cat(all_is_unknown).numpy()
     all_original_modulations = np.array(all_original_modulations) if all_original_modulations else None
+    if args.use_learned_thresholds and all_best_scores:
+        all_best_scores = torch.cat(all_best_scores).numpy()
+    else:
+        all_best_scores = None
     
     # Separate known and unknown samples
     known_mask = ~all_is_unknown
@@ -450,12 +530,10 @@ def evaluate(
     has_known = known_mask.sum() > 0
     
     if has_unknown and has_known:
-        # OOD scores: HIGHER scores mean more likely OOD (opposite of energy)
-        # Use scores directly for AUROC calculation
-        auroc = roc_auc_score(ood_labels, all_energies)  # Higher score = more OOD
-        
-        # Compute AUPR (Area Under Precision-Recall curve)
-        precision, recall, _ = precision_recall_curve(ood_labels, all_energies)
+        # Use scores where higher = more likely OOD for AUROC/AUPR
+        auc_scores = all_energies
+        auroc = roc_auc_score(ood_labels, auc_scores)
+        precision, recall, _ = precision_recall_curve(ood_labels, auc_scores)
         aupr = auc(recall, precision)
     else:
         # No unknown samples (e.g., validation set) - AUROC/AUPR undefined
@@ -464,7 +542,7 @@ def evaluate(
         logger.info('No unknown samples in dataset - AUROC/AUPR not computed')
     
     # Find optimal energy threshold if not provided
-    if energy_threshold is None:
+    if energy_threshold is None and not args.use_learned_thresholds:
         if has_unknown:
             # Test set: find threshold that maximizes F1 score
             thresholds = np.percentile(all_energies, np.linspace(0, 100, 100))
@@ -472,7 +550,8 @@ def evaluate(
             best_threshold = thresholds[0]
             
             for threshold in thresholds:
-                # Apply threshold - higher OOD scores mean more likely unknown
+                # Apply threshold - energies are negative, so reject when GREATER than threshold
+                # (greater means less negative, closer to 0, which indicates OOD)
                 predicted_unknown = all_energies > threshold
                 
                 # Compute F1 score
@@ -489,7 +568,7 @@ def evaluate(
             if known_mask.sum() > 0:
                 # Set threshold to achieve target FPR (e.g., 5%)
                 target_fpr = getattr(args, 'target_fpr', 0.05)
-                # Find the (100 - target_fpr*100) percentile of known OOD scores
+                # Find the (100 - target_fpr*100) percentile of known energies
                 percentile = (1.0 - target_fpr) * 100
                 energy_threshold = np.percentile(all_energies[known_mask], percentile)
                 logger.info(f'Energy threshold set for {target_fpr:.1%} FPR: {energy_threshold:.4f}')
@@ -498,11 +577,18 @@ def evaluate(
                 energy_threshold = np.median(all_energies)
                 logger.info(f'Using median energy as threshold: {energy_threshold:.4f}')
     
-    # Apply threshold for final predictions
-    # Reject when OOD score is GREATER than threshold (higher score = more likely OOD)
-    rejected = all_energies > energy_threshold
+    # Apply rejection for final predictions
     final_predictions = all_predictions.copy()
-    final_predictions[rejected] = -1  # Mark as unknown
+    if args.use_learned_thresholds and all_best_scores is not None:
+        # Reject when best score < 0 (below per-class threshold)
+        rejected = all_best_scores < 0
+        final_predictions[rejected] = -1
+        # For logging consistency, set energy_threshold to 0.0 under learned-threshold regime
+        energy_threshold = 0.0 if energy_threshold is None else energy_threshold
+    else:
+        # Reject when energy is GREATER than threshold (less negative, closer to 0)
+        rejected = all_energies > energy_threshold
+        final_predictions[rejected] = -1
     
     # Compute open-set accuracy
     # Correct if: (known and correctly classified) or (unknown and rejected)
@@ -559,13 +645,17 @@ def evaluate(
                 ])
                 
                 # Calculate metrics for this unknown class
-                # Higher OOD scores = more OOD
+                # Use scores where higher = more OOD directly
                 auroc_cls = roc_auc_score(combined_labels, combined_energies)
                 precision_cls, recall_cls, _ = precision_recall_curve(combined_labels, combined_energies)
                 aupr_cls = auc(recall_cls, precision_cls)
                 
                 # Detection accuracy at current threshold
-                detected = unknown_energies > energy_threshold
+                if args.use_learned_thresholds and all_best_scores is not None:
+                    unknown_best_scores = all_best_scores[unknown_mask_cls]
+                    detected = unknown_best_scores < 0
+                else:
+                    detected = unknown_energies > energy_threshold
                 detection_rate = detected.mean()
                 
                 unknown_class_metrics[f'ood_{unknown_cls}_auroc'] = auroc_cls

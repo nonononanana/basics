@@ -99,6 +99,38 @@ class MeanFlowModulation(nn.Module):
             self.sin_m = np.sin(arcface_margin)
             self.threshold = np.cos(np.pi - arcface_margin)
             self.mm = np.sin(np.pi - arcface_margin) * arcface_margin
+
+        # Learnable per-class thresholds (used for classification/rejection)
+        # Initialized to 0 so they can adapt during training if enabled
+        self.class_thresholds = nn.Parameter(torch.zeros(num_classes))
+
+        # Learnable constrained margins: m_pos < m_neg < 0 via softplus
+        self.m_pos_raw = nn.Parameter(torch.tensor(1.0))  # m_pos = -softplus(a)
+        self.m_gap_raw = nn.Parameter(torch.tensor(0.5))  # m_neg = m_pos + softplus(b)
+
+        # Optional per-class positive margins (learnable), initialized disabled
+        self.use_per_class_margins = getattr(args, 'use_learned_margins', False)
+        if self.use_per_class_margins:
+            self.m_pos_class_raw = nn.Parameter(torch.zeros(num_classes))
+
+        # Uncertainty-based auto-weights for losses (Kendall & Gal)
+        self.auto_lambda = getattr(args, 'auto_lambda', False)
+        if self.auto_lambda:
+            self.log_vars = nn.ParameterDict({
+                'rec': nn.Parameter(torch.zeros(1)),
+                'arc': nn.Parameter(torch.zeros(1)),
+                'pos': nn.Parameter(torch.zeros(1)),
+                'neg': nn.Parameter(torch.zeros(1)),
+                'rank': nn.Parameter(torch.zeros(1)),
+                'cls': nn.Parameter(torch.zeros(1)),
+                'anchor': nn.Parameter(torch.zeros(1)),
+            })
+
+        # EMA buffers for per-class energy quantile tracking for anchor loss
+        self.per_class_anchor = getattr(args, 'per_class_anchor', False)
+        if self.per_class_anchor:
+            anchor_init = torch.zeros(num_classes)
+            self.register_buffer('energy_anchor', anchor_init)
     
     def update_ema(self):
         """Update EMA networks"""
@@ -192,8 +224,16 @@ class MeanFlowModulation(nn.Module):
         class_labels: torch.Tensor,
         aug_cond: Optional[torch.Tensor] = None,
         lambda_rec: float = 1.0,
-        lambda_arc: float = 0.5,
-        lambda_ood: float = 1.0
+        lambda_arc: float = 5.0,
+        lambda_pos: float = 0.1,
+        lambda_neg: float = 0.5,
+        lambda_rank: float = 0.1,
+        lambda_cls: float = 0.0,
+        lambda_anchor: float = 0.0,
+        margin_pos: float = 0.1,
+        margin_neg: float = 0.5,
+        rank_margin: float = 0.5,
+        rank_beta: float = 10.0
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass with loss computation including energy-based losses
@@ -205,7 +245,13 @@ class MeanFlowModulation(nn.Module):
             aug_cond: Optional augmentation conditioning
             lambda_rec: Weight for reconstruction loss
             lambda_arc: Weight for ArcFace loss
-            lambda_ood: Weight for OOD detection loss using negative samples
+            lambda_pos: Weight for positive energy loss
+            lambda_neg: Weight for negative energy loss
+            lambda_rank: Weight for soft ranking loss
+            margin_pos: Margin for positive energy (should be small)
+            margin_neg: Margin for negative energy (should be large)
+            rank_margin: Margin delta for soft ranking loss
+            rank_beta: Beta parameter for soft ranking loss
         
         Returns:
             Dictionary containing different loss components
@@ -271,46 +317,147 @@ class MeanFlowModulation(nn.Module):
                 valid_labels = class_labels[valid_mask]
                 arcface_loss = self.arcface_loss(valid_features, valid_labels)
         
-        # Compute OOD detection loss using negative samples
-        ood_loss = torch.tensor(0.0, device=device)
-        if lambda_ood > 0 and x_neg is not None:
-            # Simple binary classification: positive samples are "real", negative samples are "fake"
-            # Get reconstruction errors for both positive and negative samples
-            
-            # Reconstruct positive samples (should have low reconstruction error)
-            pos_recon = self.reconstruct_sample(x_pos, class_labels, use_ema=False)
-            pos_recon_error = F.mse_loss(pos_recon, x_pos, reduction='none').mean(dim=(1, 2))
-            
-            # Reconstruct negative samples (should have high reconstruction error)
-            # Use random class labels for negative samples since they don't belong to any class
-            neg_class_labels = torch.randint(0, self.num_classes, (x_neg.shape[0],), device=device)
-            neg_recon = self.reconstruct_sample(x_neg, neg_class_labels, use_ema=False)
-            neg_recon_error = F.mse_loss(neg_recon, x_neg, reduction='none').mean(dim=(1, 2))
-            
-            # Binary classification loss: positive samples should have low error, negative high error
-            # Use margin-based loss to encourage separation
-            margin = 0.1  # Reconstruction error margin
-            
-            # Loss for positive samples: penalize if reconstruction error is too high
-            pos_loss = F.relu(pos_recon_error - margin).mean()
-            
-            # Loss for negative samples: penalize if reconstruction error is too low
-            neg_loss = F.relu(margin - neg_recon_error).mean()
-            
-            ood_loss = pos_loss + neg_loss
+        # Compute energy losses for positive samples
+        pos_energy_loss = torch.tensor(0.0, device=device)
+        if lambda_pos > 0:
+            if self.use_per_class_margins and (class_labels >= 0).any():
+                # Per-class positive anchoring using true-class energy E_y(x)
+                per_class_E = self.compute_energy_score(x_pos, return_per_class=True, use_ema=False)
+                valid_mask = class_labels >= 0
+                if valid_mask.any():
+                    idx = class_labels[valid_mask].view(-1, 1)
+                    E_y = per_class_E[valid_mask].gather(1, idx).view(-1)
+                    # Per-class margins m_pos,k = -softplus(m_pos_class_raw[k]) if available, else global
+                    if hasattr(self, 'm_pos_class_raw'):
+                        m_pos_k = -F.softplus(self.m_pos_class_raw[class_labels[valid_mask]])
+                    else:
+                        m_pos_global = -F.softplus(self.m_pos_raw)
+                        m_pos_k = m_pos_global.expand_as(E_y)
+                    pos_energy_loss = F.leaky_relu(E_y - m_pos_k).mean()
+                else:
+                    pos_energy_loss = torch.tensor(0.0, device=device)
+            else:
+                # Global anchoring on aggregated energy
+                pos_energies = self.compute_energy_score(x_pos, return_per_class=False, use_ema=False)
+                m_pos = -F.softplus(self.m_pos_raw) if self.use_per_class_margins else margin_pos
+                pos_energy_loss = F.leaky_relu(pos_energies - m_pos).mean()
         
-        # Total loss with weighted components
-        total_loss = (
+        # Compute energy losses for negative samples
+        neg_energy_loss = torch.tensor(0.0, device=device)
+        if lambda_neg > 0 and x_neg is not None:
+            # Compute energy score for negative samples using MAIN network for training
+            neg_energies = self.compute_energy_score(x_neg, return_per_class=False, use_ema=False)
+            
+            if self.use_per_class_margins:
+                m_pos = -F.softplus(self.m_pos_raw)
+                m_gap = F.softplus(self.m_gap_raw)
+                m_neg = m_pos + m_gap  # still < 0
+            else:
+                m_neg = margin_neg
+            # Push negatives toward being less negative than m_neg (closer to 0)
+            neg_energy_loss = F.leaky_relu(m_neg - neg_energies).mean()
+        
+        # Compute soft ranking loss to encourage separation between positive and negative energies
+        rank_loss = torch.tensor(0.0, device=device)
+        if lambda_rank > 0 and x_neg is not None:
+            # We want E_pos < E_neg (more negative for positive, less negative for negative)
+            # L_rank = (1/β) * log(1 + exp(β * (E_p - E_n + Δ)))
+            # where Δ is the margin (positive value)
+            
+            # Get energies (reuse if already computed, otherwise compute)
+            if lambda_pos == 0:
+                pos_energies = self.compute_energy_score(x_pos, return_per_class=False, use_ema=False)
+            if lambda_neg == 0:
+                neg_energies = self.compute_energy_score(x_neg, return_per_class=False, use_ema=False)
+            
+            # Compute pairwise ranking loss
+            # We want pos_energies to be more negative than neg_energies by at least rank_margin
+            # Reshape for pairwise computation
+            pos_energies_expanded = pos_energies.unsqueeze(1)  # [batch, 1]
+            neg_energies_expanded = neg_energies.unsqueeze(0)  # [1, batch]
+            
+            # Compute soft ranking loss for all pairs
+            # E_p - E_n + Δ where we want this to be negative
+            if self.use_per_class_margins:
+                m_gap = F.softplus(self.m_gap_raw)  # positive gap
+                margin_for_rank = m_gap.detach()  # keep rank margin stable
+            else:
+                margin_for_rank = torch.tensor(rank_margin, device=device)
+            energy_diff = pos_energies_expanded - neg_energies_expanded + margin_for_rank
+            
+            # Soft ranking loss: (1/β) * log(1 + exp(β * energy_diff))
+            rank_loss = (1.0 / rank_beta) * torch.log(1 + torch.exp(rank_beta * energy_diff))
+            rank_loss = rank_loss.mean()  # Average over all pairs
+
+        # Classification loss using per-class energies and learnable thresholds
+        classification_loss = torch.tensor(0.0, device=device)
+        if lambda_cls > 0 and (class_labels >= 0).any():
+            per_class_energies = self.compute_energy_score(x_pos, return_per_class=True, use_ema=False)
+            # logits = (tau_k - E_k) / T
+            temp = max(float(self.energy_temperature), 1e-6)
+            logits = (self.class_thresholds.view(1, -1) - per_class_energies) / temp
+            valid_mask = class_labels >= 0
+            if valid_mask.any():
+                classification_loss = F.cross_entropy(logits[valid_mask], class_labels[valid_mask])
+        
+        # Optional per-class threshold anchor loss using EMA quantile targets
+        anchor_loss = torch.tensor(0.0, device=device)
+        if self.per_class_anchor and lambda_anchor > 0 and (class_labels >= 0).any():
+            # Compute per-class energies and update class-wise anchors using only true-class samples
+            per_class_E = self.compute_energy_score(x_pos, return_per_class=True, use_ema=False)
+            q = getattr(self.args, 'anchor_quantile', 0.2)
+            delta = getattr(self.args, 'anchor_delta', 0.2)
+            momentum = getattr(self.args, 'anchor_momentum', 0.9)
+            with torch.no_grad():
+                updated_anchor = self.energy_anchor.clone()
+                for k in range(self.num_classes):
+                    mask_k = (class_labels == k)
+                    if mask_k.any():
+                        energies_k = per_class_E[mask_k, k]
+                        batch_q_k = energies_k.quantile(q)
+                        updated_anchor[k] = momentum * self.energy_anchor[k] + (1 - momentum) * batch_q_k
+                self.energy_anchor.copy_(updated_anchor)
+            # Encourage tau_k to match anchor - delta
+            target = self.energy_anchor - delta
+            anchor_loss = F.smooth_l1_loss(self.class_thresholds, target.detach())
+
+        # Total loss with manual lambdas
+        total_manual = (
             lambda_rec * reconstruction_loss +
             lambda_arc * arcface_loss +
-            lambda_ood * ood_loss
+            lambda_pos * pos_energy_loss +
+            lambda_neg * neg_energy_loss +
+            lambda_rank * rank_loss +
+            lambda_cls * classification_loss +
+            lambda_anchor * anchor_loss
         )
+
+        # Or with uncertainty-based auto-weights
+        if self.auto_lambda:
+            def uw(loss, key):
+                s = self.log_vars[key]
+                return torch.exp(-s) * loss + s
+            total_loss = (
+                uw(reconstruction_loss, 'rec') +
+                uw(arcface_loss, 'arc') +
+                uw(pos_energy_loss, 'pos') +
+                uw(neg_energy_loss, 'neg') +
+                uw(rank_loss, 'rank') +
+                uw(classification_loss, 'cls') +
+                uw(anchor_loss, 'anchor')
+            )
+        else:
+            total_loss = total_manual
         
         return {
             'total_loss': total_loss,
             'reconstruction_loss': reconstruction_loss,
             'arcface_loss': arcface_loss,
-            'ood_loss': ood_loss
+            'pos_energy_loss': pos_energy_loss,
+            'neg_energy_loss': neg_energy_loss,
+            'rank_loss': rank_loss,
+            'classification_loss': classification_loss,
+            'anchor_loss': anchor_loss
         }
     
     def sample(
@@ -356,91 +503,6 @@ class MeanFlowModulation(nn.Module):
         
         return z_0
     
-    def reconstruct_sample(
-        self,
-        x: torch.Tensor,
-        class_labels: torch.Tensor,
-        use_ema: bool = True
-    ) -> torch.Tensor:
-        """
-        Reconstruct a sample using the model
-        
-        Args:
-            x: Input signal [batch_size, 2, 128]
-            class_labels: Class labels for conditioning
-            use_ema: Whether to use EMA network
-            
-        Returns:
-            Reconstructed signal [batch_size, 2, 128]
-        """
-        net = self.net_ema if use_ema else self.net
-        batch_size = x.shape[0]
-        device = x.device
-        
-        # Add noise and then reconstruct
-        e = torch.randn_like(x)
-        t = torch.full((batch_size,), 0.5, device=device)  # Use middle timestep
-        t_expanded = t.view(-1, 1, 1)
-        
-        # Interpolate between data and noise
-        z = (1 - t_expanded) * x + t_expanded * e
-        
-        # Predict velocity
-        with torch.no_grad() if use_ema else torch.enable_grad():
-            u = net(z, (t, t), aug_cond=None, class_labels=class_labels)
-            
-            # Reconstruct by removing predicted noise
-            x_recon = z - t_expanded * u
-        
-        return x_recon
-    
-    def classify_and_detect_ood(
-        self,
-        x: torch.Tensor,
-        use_ema: bool = True
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Classify samples and compute OOD detection scores
-        
-        Args:
-            x: Input signals [batch_size, 2, 128]
-            use_ema: Whether to use EMA network
-            
-        Returns:
-            predictions: Class predictions [batch_size]
-            ood_scores: OOD detection scores (higher = more likely OOD) [batch_size]
-        """
-        batch_size = x.shape[0]
-        device = x.device
-        
-        # Compute reconstruction error for each class
-        class_errors = []
-        
-        for class_idx in range(self.num_classes):
-            class_labels = torch.full((batch_size,), class_idx, dtype=torch.long, device=device)
-            
-            # Reconstruct using this class
-            x_recon = self.reconstruct_sample(x, class_labels, use_ema=use_ema)
-            
-            # Compute reconstruction error
-            recon_error = F.mse_loss(x_recon, x, reduction='none').mean(dim=(1, 2))
-            class_errors.append(recon_error)
-        
-        # Stack errors for all classes [batch_size, num_classes]
-        class_errors = torch.stack(class_errors, dim=1)
-        
-        # Best class prediction (lowest reconstruction error)
-        predictions = class_errors.argmin(dim=1)
-        
-        # OOD score: minimum reconstruction error (lower error = more in-distribution)
-        # We want higher scores for OOD, so we use negative of min error or some transformation
-        min_errors = class_errors.min(dim=1)[0]
-        
-        # Simple OOD score: use reconstruction error directly (higher = more OOD)
-        ood_scores = min_errors
-        
-        return predictions, ood_scores
-    
     def compute_energy_score(
         self,
         x: torch.Tensor,
@@ -465,97 +527,94 @@ class MeanFlowModulation(nn.Module):
         
         # Select which network to use
         net = self.net_ema if use_ema else self.net
-        
-        if return_per_class:
-            # Compute energy for each class
-            energies = []
-            
-            for class_idx in range(self.num_classes):
-                # Create labels for this class
-                class_labels = torch.full((batch_size,), class_idx, dtype=torch.long, device=device)
-                
-                # Compute reconstruction under this class assumption
-                # Only use no_grad for inference (when using EMA)
-                if use_ema:
-                    with torch.no_grad():
-                        # Sample noise
-                        e = torch.randn_like(x)
-                        
-                        # Use intermediate time for energy computation
-                        t = torch.full((batch_size,), 0.5, device=device)
-                        t_expanded = t.view(-1, 1, 1)
-                        
-                        # Interpolate
-                        z = (1 - t_expanded) * x + t_expanded * e
-                        
-                        # Predict velocity field
-                        u = net(
-                            z,
-                            (t, t),
-                            aug_cond=None,
-                            class_labels=class_labels
-                        )
-                        
-                        # Compute reconstruction
-                        x_recon = z - t_expanded * u
-                        
-                        # Compute reconstruction error as energy
-                        error = (x - x_recon)**2
-                        error = error.mean(dim=(1, 2))  # Mean over channel and time dimensions
-                        
-                        energies.append(error)
-                else:
-                    # Training mode - need gradients
-                    # Sample noise
-                    e = torch.randn_like(x)
-                    
-                    # Use intermediate time for energy computation
+
+        # Compute energy for each class
+        energies: List[torch.Tensor] = []
+        for class_idx in range(self.num_classes):
+            class_labels = torch.full((batch_size,), class_idx, dtype=torch.long, device=device)
+
+            # Deterministic energy at evaluation to avoid metric noise
+            if use_ema:
+                with torch.no_grad():
+                    e = torch.zeros_like(x)
                     t = torch.full((batch_size,), 0.5, device=device)
                     t_expanded = t.view(-1, 1, 1)
-                    
-                    # Interpolate
                     z = (1 - t_expanded) * x + t_expanded * e
-                    
-                    # Predict velocity field
                     u = net(
                         z,
                         (t, t),
                         aug_cond=None,
                         class_labels=class_labels
                     )
-                    
-                    # Compute reconstruction
                     x_recon = z - t_expanded * u
-                    
-                    # Compute reconstruction error as energy
                     error = (x - x_recon)**2
-                    error = error.mean(dim=(1, 2))  # Mean over channel and time dimensions
-                    
+                    error = error.mean(dim=(1, 2))
                     energies.append(error)
-            
-            # Stack energies for all classes
-            energies = torch.stack(energies, dim=1)  # [batch_size, num_classes]
-            
-            # Apply temperature scaling and compute log-sum-exp
-            # This gives us the energy score
-            energy_score = -self.energy_temperature * torch.logsumexp(
-                -energies / self.energy_temperature, dim=1
-            )
-            
-            if return_per_class:
-                return energies
             else:
-                return energy_score
-        else:
-            # Compute minimum energy across all classes
-            energies = self.compute_energy_score(x, return_per_class=True, use_ema=use_ema)
-            
-            # Return negative log-sum-exp as energy score
-            energy_score = -self.energy_temperature * torch.logsumexp(
-                -energies / self.energy_temperature, dim=1
-            )
-            
-            return energy_score
+                # Training mode can keep stochastic e for gradient richness
+                e = torch.randn_like(x)
+                t = torch.full((batch_size,), 0.5, device=device)
+                t_expanded = t.view(-1, 1, 1)
+                z = (1 - t_expanded) * x + t_expanded * e
+                u = net(
+                    z,
+                    (t, t),
+                    aug_cond=None,
+                    class_labels=class_labels
+                )
+                x_recon = z - t_expanded * u
+                error = (x - x_recon)**2
+                error = error.mean(dim=(1, 2))
+                energies.append(error)
+
+        energies = torch.stack(energies, dim=1)  # [batch_size, num_classes]
+
+        if return_per_class:
+            return energies
+
+        # Aggregate to a single energy score via log-sum-exp over classes
+        temp = max(float(self.energy_temperature), 1e-6)
+        energy_score = -temp * torch.logsumexp(
+            -energies / temp, dim=1
+        )
+        return energy_score
+
+    def compute_classification_logits(
+        self,
+        x: torch.Tensor,
+        use_ema: bool = True
+    ) -> torch.Tensor:
+        """
+        Compute per-class classification logits using per-class energies and
+        learnable thresholds. Higher logits indicate higher confidence.
+
+        logits_k = (tau_k - E_k(x)) / T
+        """
+        per_class_energies = self.compute_energy_score(x, return_per_class=True, use_ema=use_ema)
+        # Broadcast thresholds to batch
+        shifted = self.class_thresholds.view(1, -1) - per_class_energies
+        temp = max(float(self.energy_temperature), 1e-6)
+        logits = shifted / temp
+        return logits
+
+    def classify_with_learned_threshold(
+        self,
+        x: torch.Tensor,
+        use_ema: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Classify with per-class thresholds. Predicts the class with highest
+        (tau_k - E_k). Rejects as unknown if the best score < 0.
+
+        Returns: predictions, scores, per_class_energies
+        """
+        per_class_energies = self.compute_energy_score(x, return_per_class=True, use_ema=use_ema)
+        scores = self.class_thresholds.view(1, -1) - per_class_energies
+        best_scores, preds = scores.max(dim=1)
+        reject_mask = best_scores < 0
+        preds = preds.clone()
+        preds[reject_mask] = -1
+        return preds, best_scores, per_class_energies
     
     def classify_with_rejection(
         self,

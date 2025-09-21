@@ -509,6 +509,7 @@ def evaluate(
                 if args.use_learned_thresholds:
                     _, neg_best_scores, _ = model.classify_with_learned_threshold(neg_signals, use_ema=True)
                     neg_scores = -neg_best_scores  # higher = more OOD
+                    all_best_scores.append(neg_best_scores.cpu())  # Fix: append synthetic negative scores
                 else:
                     neg_scores = model.compute_energy_score(neg_signals, use_ema=True)
                 # Append as unknowns

@@ -53,3 +53,4 @@ echo "- Test AUROC should increase significantly (>0.7)"
 echo "- FPR should be around target (5%)"
 echo "- Better separation between known/unknown energy distributions"
 echo "- Improved closed-set accuracy with ArcFace"
+

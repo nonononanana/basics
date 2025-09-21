@@ -173,3 +173,4 @@ If results don't improve:
 The key insight is that your model needs explicit supervision to separate energy distributions. With `lambda_neg=0`, it had no incentive to push negative samples toward higher (less negative) energies. The soft ranking loss provides additional pairwise supervision to maintain a margin between distributions.
 
 These changes should significantly improve your OOD detection performance while maintaining or improving closed-set accuracy.
+

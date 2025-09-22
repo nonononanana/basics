@@ -509,7 +509,8 @@ def evaluate(
                 if args.use_learned_thresholds:
                     _, neg_best_scores, _ = model.classify_with_learned_threshold(neg_signals, use_ema=True)
                     neg_scores = -neg_best_scores  # higher = more OOD
-                    all_best_scores.append(neg_best_scores.cpu())  # Fix: append synthetic negative scores
+                    # Keep arrays aligned: append synthetic negatives' best scores
+                    all_best_scores.append(neg_best_scores.cpu())
                 else:
                     neg_scores = model.compute_energy_score(neg_signals, use_ema=True)
                 # Append as unknowns
@@ -618,6 +619,18 @@ def evaluate(
     correct_unknown = unknown_mask & (final_predictions == -1)
     open_set_accuracy = (correct_known | correct_unknown).mean()
     
+    # Build dataset-only views (exclude synthetic negatives appended above)
+    # Synthetic negatives have prediction -1 before rejection
+    dataset_mask = (all_predictions != -1)
+    if all_original_modulations is not None:
+        dataset_final_predictions = final_predictions[dataset_mask]
+        dataset_energies = all_energies[dataset_mask]
+        dataset_known_mask = known_mask[dataset_mask]
+        if args.use_learned_thresholds and all_best_scores is not None:
+            dataset_best_scores = all_best_scores[dataset_mask]
+        else:
+            dataset_best_scores = None
+
     # Compute per-class accuracy for known classes (using class index)
     class_accuracies = {}
     for class_idx in range(model.num_classes): # Model expects 0-8 for 9 known classes
@@ -645,10 +658,10 @@ def evaluate(
                 if mod in known_classes:
                     # Known class - check classification accuracy
                     mod_label = known_classes.index(mod)
-                    mod_acc = (final_predictions[mod_mask] == mod_label).mean()
+                    mod_acc = (dataset_final_predictions[mod_mask] == mod_label).mean()
                 else:
                     # Unknown class - check if correctly rejected
-                    mod_acc = (final_predictions[mod_mask] == -1).mean()
+                    mod_acc = (dataset_final_predictions[mod_mask] == -1).mean()
                 
                 modulation_accuracies[f'{mod}'] = mod_acc
         
@@ -657,12 +670,12 @@ def evaluate(
             unknown_mask_cls = all_original_modulations == unknown_cls
             if unknown_mask_cls.sum() > 0:
                 # Get energies for this specific unknown class
-                unknown_energies = all_energies[unknown_mask_cls]
+                unknown_energies = dataset_energies[unknown_mask_cls]
                 
                 # Combine with known energies for AUROC
-                combined_energies = np.concatenate([all_energies[known_mask], unknown_energies])
+                combined_energies = np.concatenate([dataset_energies[dataset_known_mask], unknown_energies])
                 combined_labels = np.concatenate([
-                    np.zeros(known_mask.sum()),  # Known = 0
+                    np.zeros(dataset_known_mask.sum()),  # Known = 0
                     np.ones(len(unknown_energies))  # Unknown = 1
                 ])
                 
@@ -674,7 +687,7 @@ def evaluate(
                 
                 # Detection accuracy at current threshold
                 if args.use_learned_thresholds and all_best_scores is not None:
-                    unknown_best_scores = all_best_scores[unknown_mask_cls]
+                    unknown_best_scores = dataset_best_scores[unknown_mask_cls]
                     detected = unknown_best_scores < 0
                 else:
                     detected = unknown_energies > energy_threshold

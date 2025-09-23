@@ -839,7 +839,7 @@ def main():
             args.per_class_anchor = False
             # classic weights
             args.lambda_rec = 1.0
-            args.lambda_arc = 0.2 if args.use_arcface else 0.0
+            args.lambda_arc = 0.05 if args.use_arcface else 0.0
             args.lambda_pos = 0.3
             args.lambda_neg = 0.2
             args.lambda_rank = 0.1
@@ -851,7 +851,7 @@ def main():
             args.auto_lambda = False
             args.per_class_anchor = True
             args.lambda_rec = 1.0
-            args.lambda_arc = 0.2 if args.use_arcface else 0.0
+            args.lambda_arc = 0.05 if args.use_arcface else 0.0
             args.lambda_pos = 0.3
             args.lambda_neg = 0.2
             args.lambda_rank = 0.1
@@ -863,7 +863,7 @@ def main():
             args.auto_lambda = False
             args.per_class_anchor = False
             args.lambda_rec = 1.0
-            args.lambda_arc = 0.2 if args.use_arcface else 0.0
+            args.lambda_arc = 0.05 if args.use_arcface else 0.0
             args.lambda_pos = 0.3
             args.lambda_neg = 0.2
             args.lambda_rank = 0.1
@@ -876,7 +876,7 @@ def main():
             args.per_class_anchor = True
             # λ magnitudes are ignored by auto_lambda, but keep them > 0 to include terms
             args.lambda_rec = 1.0
-            args.lambda_arc = 0.2 if args.use_arcface else 0.0
+            args.lambda_arc = 0.05 if args.use_arcface else 0.0
             args.lambda_pos = 0.3
             args.lambda_neg = 0.2
             args.lambda_rank = 0.1

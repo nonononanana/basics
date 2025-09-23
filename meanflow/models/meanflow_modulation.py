@@ -323,11 +323,17 @@ class MeanFlowModulation(nn.Module):
         # Compute ArcFace loss if enabled and we have valid labels
         arcface_loss = torch.tensor(0.0, device=device)
         if self.use_arcface and (class_labels >= 0).any():
-            # Extract features from intermediate representation
-            # Use class embeddings as features for ArcFace
+            # Extract sample-dependent features from UNet and use for ArcFace
+            # Use the same (t, h) as used for reconstruction to reflect current step
+            features = self.net.forward_features(
+                x=x_pos,
+                time_cond=(t.view(-1), (t - r).view(-1)),
+                aug_cond=aug_cond,
+                class_labels=class_labels
+            )  # [batch, class_embed_dim]
             valid_mask = class_labels >= 0
             if valid_mask.any():
-                valid_features = class_embeds[valid_mask]
+                valid_features = features[valid_mask]
                 valid_labels = class_labels[valid_mask]
                 arcface_loss = self.arcface_loss(valid_features, valid_labels)
         

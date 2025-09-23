@@ -68,17 +68,17 @@ def parse_args():
                        help='Weight decay for regularization')
     parser.add_argument('--class_dropout', type=float, default=0.1,
                        help='Class dropout for classifier-free guidance')
-    parser.add_argument('--use_arcface', action='store_true', default=True,
+    parser.add_argument('--use_arcface', action='store_true',
                        help='Use ArcFace loss for better class separation')
-    parser.add_argument('--arcface_margin', type=float, default=0.5,
+    parser.add_argument('--arcface_margin', type=float, default=0.3,
                        help='ArcFace margin parameter')
-    parser.add_argument('--arcface_scale', type=float, default=15.0,
+    parser.add_argument('--arcface_scale', type=float, default=30.0,
                        help='ArcFace scale parameter')
     
     # Energy loss hyperparameters
     parser.add_argument('--lambda_rec', type=float, default=1.0,
                        help='Weight for reconstruction loss')
-    parser.add_argument('--lambda_arc', type=float, default=0.5,
+    parser.add_argument('--lambda_arc', type=float, default=0.1,
                        help='Weight for ArcFace loss')
     parser.add_argument('--lambda_pos', type=float, default=0.5,
                        help='Weight for positive energy loss')
@@ -152,7 +152,7 @@ def parse_args():
                        help='Use learned per-class thresholds for classification and OOD rejection during evaluation')
     parser.add_argument('--use_learned_margins', action='store_true', default=True,
                        help='Use constrained learned margins for energy losses (m_pos,m_neg)')
-    parser.add_argument('--auto_lambda', action='store_true', default=True,
+    parser.add_argument('--auto_lambda', action='store_true', 
                        help='Enable uncertainty-based auto-weighting for losses')
     parser.add_argument('--per_class_anchor', action='store_true', default=True,
                        help='Enable per-class threshold anchor to energy quantiles')
@@ -292,6 +292,7 @@ def train_epoch(
     
     # Initialize metrics
     total_loss = 0.0
+    total_loss_manual = 0.0
     reconstruction_loss = 0.0
     arcface_loss = 0.0
     pos_energy_loss = 0.0
@@ -389,6 +390,8 @@ def train_epoch(
         
         # Update metrics
         total_loss += loss.item()
+        if 'total_loss_manual' in loss_dict:
+            total_loss_manual += loss_dict['total_loss_manual'].item()
         reconstruction_loss += loss_dict['reconstruction_loss'].item()
         if args.use_arcface:
             arcface_loss += loss_dict['arcface_loss'].item()
@@ -411,6 +414,7 @@ def train_epoch(
         current_lr = optimizer.param_groups[0]['lr']
         progress_bar.set_postfix({
             'Loss': f'{current_loss:.4f}',
+            'Loss(man)': f'{(total_loss_manual / num_batches):.4f}' if total_loss_manual > 0 else 'n/a',
             'Rec': f'{(reconstruction_loss / num_batches):.4f}',
             'Pos': f'{(pos_energy_loss / num_batches):.4f}',
             'Neg': f'{(neg_energy_loss / num_batches):.4f}',
@@ -422,6 +426,7 @@ def train_epoch(
     # Compute average metrics
     metrics = {
         'train/total_loss': total_loss / num_batches,
+        'train/total_loss_manual': total_loss_manual / num_batches if total_loss_manual > 0 else 0.0,
         'train/reconstruction_loss': reconstruction_loss / num_batches,
         'train/arcface_loss': arcface_loss / num_batches if args.use_arcface else 0.0,
         'train/pos_energy_loss': pos_energy_loss / num_batches,

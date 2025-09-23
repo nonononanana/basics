@@ -359,6 +359,7 @@ class ModulationUNet(nn.Module):
         self.num_blocks = num_blocks
         self.dropout = dropout
         self.class_dropout = class_dropout
+        self.class_embed_dim = class_embed_dim
         
         # Time embedding dimension
         time_embed_dim = model_channels * 4
@@ -489,6 +490,11 @@ class ModulationUNet(nn.Module):
             padding=1,
             init_weight=0.0
         )
+
+        # Representation head for sample-dependent embeddings (for ArcFace etc.)
+        # Map the last hidden channels (after final_norm) pooled over time to class_embed_dim
+        self.hidden_channels = now_channels
+        self.rep_head = Linear(self.hidden_channels, self.class_embed_dim)
     
     def forward(
         self,
@@ -582,3 +588,79 @@ class ModulationUNet(nn.Module):
             h = h.view(x.shape)
         
         return h
+
+    def forward_features(
+        self,
+        x: torch.Tensor,
+        time_cond: Tuple[torch.Tensor, torch.Tensor],
+        aug_cond: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Compute sample-dependent representation vector from the network, without
+        producing the final signal output. This is intended for auxiliary losses
+        like ArcFace.
+
+        Returns: [batch, class_embed_dim]
+        """
+        # Ensure input shape [batch, 2, 128]
+        if x.dim() == 3 and x.shape[1] == 2 and x.shape[2] == 128:
+            pass
+        else:
+            batch_size = x.shape[0]
+            x = x.view(batch_size, 2, 128)
+
+        # Extract time conditions
+        t, h = time_cond
+
+        # Compute time embedding
+        time_emb = self.time_embed(t) + self.time_embed(h)
+
+        # Optionally add class embedding
+        if class_labels is not None:
+            class_emb = self.class_embed(class_labels)
+            class_emb = self.class_proj(class_emb)
+            if self.training and self.class_dropout > 0:
+                drop_mask = (torch.rand(class_labels.shape[0], device=x.device) < self.class_dropout)
+                if drop_mask.any():
+                    class_emb = class_emb.clone()
+                    null_row = self.null_class_time.to(dtype=class_emb.dtype, device=class_emb.device).unsqueeze(0)
+                    class_emb[drop_mask] = null_row.expand(class_emb[drop_mask].shape[0], -1)
+            time_emb = time_emb + class_emb
+
+        emb = silu(time_emb)
+
+        # Initial conv
+        h_state = self.init_conv(x)
+
+        # Encoder
+        skips = [h_state]
+        for module in self.encoder:
+            if isinstance(module, ModulationUNetBlock):
+                h_state = module(h_state, emb)
+                skips.append(h_state)
+            else:
+                h_state = module(h_state)
+                skips.append(h_state)
+
+        # Middle
+        for module in self.middle:
+            h_state = module(h_state, emb)
+
+        # Decoder
+        for module in self.decoder:
+            if isinstance(module, nn.ConvTranspose1d):
+                h_state = module(h_state)
+            else:
+                skip = skips.pop()
+                h_state = torch.cat([h_state, skip], dim=1)
+                h_state = module(h_state, emb)
+
+        # Pre-output hidden state
+        h_state = self.final_norm(h_state)
+        h_state = silu(h_state)
+
+        # Global average pool over time and project to embedding dim
+        pooled = h_state.mean(dim=2)
+        rep = self.rep_head(pooled)
+        return rep

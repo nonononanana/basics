@@ -412,21 +412,21 @@ def train_epoch(
         # Update progress bar with current metrics
         current_loss = total_loss / num_batches
         current_lr = optimizer.param_groups[0]['lr']
-        progress_bar.set_postfix({
+        postfix = {
             'Loss': f'{current_loss:.4f}',
-            'Loss(man)': f'{(total_loss_manual / num_batches):.4f}' if total_loss_manual > 0 else 'n/a',
             'Rec': f'{(reconstruction_loss / num_batches):.4f}',
             'Pos': f'{(pos_energy_loss / num_batches):.4f}',
             'Neg': f'{(neg_energy_loss / num_batches):.4f}',
             'lr': f'{current_lr:.2e}',
             'Arc': f'{(arcface_loss / num_batches):.4f}' if args.use_arcface else '0.0000',
-
-        })
+        }
+        if args.auto_lambda and total_loss_manual > 0:
+            postfix['Loss(man)'] = f'{(total_loss_manual / num_batches):.4f}'
+        progress_bar.set_postfix(postfix)
     
     # Compute average metrics
     metrics = {
         'train/total_loss': total_loss / num_batches,
-        'train/total_loss_manual': total_loss_manual / num_batches if total_loss_manual > 0 else 0.0,
         'train/reconstruction_loss': reconstruction_loss / num_batches,
         'train/arcface_loss': arcface_loss / num_batches if args.use_arcface else 0.0,
         'train/pos_energy_loss': pos_energy_loss / num_batches,
@@ -434,6 +434,8 @@ def train_epoch(
         'train/rank_loss': rank_loss / num_batches,
         'train/learning_rate': optimizer.param_groups[0]['lr']
     }
+    if args.auto_lambda and total_loss_manual > 0:
+        metrics['train/total_loss_manual'] = total_loss_manual / num_batches
     if args.lambda_cls > 0:
         metrics['train/classification_loss'] = classification_loss / num_batches
     if args.lambda_anchor > 0:

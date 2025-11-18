@@ -781,6 +781,8 @@ def main():
                        help='Path to RML2016.10a dataset')
     parser.add_argument('--experiment_setting', type=int, default=None,
                        help='Experiment setting (1-12). If None, uses checkpoint setting.')
+    parser.add_argument('--normalize', action='store_true', default=False,
+                       help='Normalize I/Q samples in the dataset')
     parser.add_argument('--device', type=str, default=None,
                        help='Device (cuda/cpu). Auto-detects if None.')
     parser.add_argument('--samples_per_class', type=int, default=1000,
@@ -822,7 +824,7 @@ def main():
         experiment_setting=experiment_setting,
         split='test',
         snr_range=(-20, 20),
-        normalize=True,
+        normalize=args.normalize,
         return_snr=True,
         seed=42,
         precompute_negatives=False

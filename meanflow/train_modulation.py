@@ -139,6 +139,10 @@ def parse_args():
     parser.add_argument('--ratio', type=float, default=0.5,
                        help='Ratio for time sampling')
     
+    # Data preprocessing arguments
+    parser.add_argument('--normalize', action='store_true', default=False,
+                       help='Normalize I/Q samples in the dataset')
+    
     # Evaluation arguments
     parser.add_argument('--eval_freq', type=int, default=5,
                        help='Evaluation frequency (epochs)')
@@ -914,7 +918,7 @@ def main():
         train_split=0.8,
         val_split=0.1,
         test_split=0.1,
-        normalize=True,
+        normalize=args.normalize,
         seed=args.seed,
         precompute_negatives=False
     )

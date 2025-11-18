@@ -99,7 +99,7 @@ class RML2016Dataset(Dataset):
         train_split: float = 0.8,  # 80% for training
         val_split: float = 0.1,  # 10% for validation
         test_split: float = 0.1,  # 10% for testing
-        normalize: bool = True,  # Normalize I/Q samples
+        normalize: bool = False,  # Normalize I/Q samples
         return_snr: bool = False,  # Return SNR as additional info
         seed: int = 42,
         precompute_negatives: bool = True  # Pre-compute negative samples
@@ -569,7 +569,7 @@ def get_rml_dataloaders(
     train_split: float = 0.8,
     val_split: float = 0.1,
     test_split: float = 0.1,
-    normalize: bool = True,
+    normalize: bool = False,
     seed: int = 42,
     precompute_negatives: bool = True
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:

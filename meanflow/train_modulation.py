@@ -30,10 +30,10 @@ from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, confusio
 from sklearn.metrics import classification_report
 
 # Import custom modules
-from data.rml_dataset import get_rml_dataloaders, RML2016Dataset, EXPERIMENT_SETTINGS
-from models.meanflow_modulation import MeanFlowModulation
-from models.unet_modulation import ModulationUNet
-from training import distributed_mode
+from meanflow.data.rml_dataset import get_rml_dataloaders, RML2016Dataset, EXPERIMENT_SETTINGS
+from meanflow.models.meanflow_modulation import MeanFlowModulation
+from meanflow.models.unet_modulation import ModulationUNet
+from meanflow.training import distributed_mode
 
 # Setup logging
 logging.basicConfig(

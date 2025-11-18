@@ -10,8 +10,8 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Tuple, Dict, List
 
-from models.time_sampler import sample_two_timesteps
-from models.ema import init_ema, update_ema_net
+from meanflow.models.time_sampler import sample_two_timesteps
+from meanflow.models.ema import init_ema, update_ema_net
 import logging
 
 logger = logging.getLogger(__name__)

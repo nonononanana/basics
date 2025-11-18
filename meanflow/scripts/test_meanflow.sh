@@ -15,9 +15,10 @@ cd /userhome/MeanFlowOpenSetAMC
 python -m meanflow.train_modulation \
     --data_path data/RML2016.10a_dict.pkl \
     --experiment_setting 1 \
+    --mode custom \
     --epochs 50 \
     --eval_freq 5 \
-    --batch_size 256 \
+    --batch_size 128 \
     --lr 2e-4 \
     --lambda_rec 1.0 \
     --lambda_arc 0.0 \
@@ -31,11 +32,8 @@ python -m meanflow.train_modulation \
     --rank_margin 0.5 \
     --rank_beta 10.0 \
     --target_fpr 0.05 \
-    --use_arcface \
-    --arcface_margin 0.3 \
-    --arcface_scale 15.0 \
-    --output_dir outputs/improved_modulation \
-    --wandb_name improved_exp1_proper_losses \
+    --output_dir outputs/test_gen \
+    --wandb_name test_gen \
     --device cuda \
     --seed 42
 
@@ -57,11 +55,11 @@ echo "=========================================="
 
 # Run generative evaluation on the trained model
 bash scripts/eval_generation.sh \
-    --checkpoint outputs/improved_modulation/best_model.pth \
+    --checkpoint outputs/test_gen/best_model.pth \
     --data_path data/RML2016.10a_dict.pkl \
     --experiment_setting 1 \
     --samples_per_class 1000 \
-    --batch_size 256 \
+    --batch_size 512 \
     --metrics mmd,c2st,fid,psd,hist \
     --device cuda
 

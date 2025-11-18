@@ -58,3 +58,6 @@ output_dir/
 *logs/
 *.out
 *.err
+wandb/
+wandb.tar
+

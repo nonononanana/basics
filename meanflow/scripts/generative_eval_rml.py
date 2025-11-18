@@ -30,6 +30,19 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.model_selection import train_test_split
 
+
+def _json_default(obj):
+    """Helper to make numpy scalars/arrays JSON serializable."""
+    import numpy as np
+
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return str(obj)
+
 # Add parent directory to path for imports
 script_dir = Path(__file__).parent
 meanflow_dir = script_dir.parent  # meanflow/ directory
@@ -739,7 +752,7 @@ def evaluate_generative_quality(
     # Save results
     results_file = output_dir / 'metrics.json'
     with open(results_file, 'w') as f:
-        json.dump(all_metrics, f, indent=2)
+        json.dump(all_metrics, f, indent=2, default=_json_default)
     logger.info(f"\nResults saved to {results_file}")
     
     # Print summary

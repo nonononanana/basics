@@ -113,7 +113,7 @@ def train_one_epoch(
             break
 
         samples = samples.to(device, non_blocking=True)
-        samples = samples * 2.0 - 1.0
+        # samples = samples * 2.0 - 1.0
 
         samples, aug_cond = rng.augment_with_rng_control(augment_pipe, samples, args.seed, steps) if args.use_edm_aug else (samples, None)
 

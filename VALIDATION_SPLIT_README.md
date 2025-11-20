@@ -15,7 +15,7 @@ The dataset is now split into three sets with the following proportions:
 | Dataset | Proportion | Known Classes | Unknown Classes | Negative Samples | Purpose |
 |---------|------------|---------------|-----------------|------------------|----------|
 | Train | 80% | ✅ Yes | ❌ No | ✅ Yes | Model training with contrastive learning |
-| Validation | 10% | ✅ Yes | ❌ No | ❌ No | Model selection, early stopping |
+| Validation | 10% | ✅ Yes | ✅ Yes | ❌ No | Model selection, early stopping, OOD detection tuning |
 | Test | 10% | ✅ Yes | ✅ Yes | ❌ No | Final evaluation, AUROC/AUPR metrics |
 
 ## Implementation Changes
@@ -90,9 +90,9 @@ train_loader, val_loader, test_loader = get_rml_dataloaders(
 - Learns energy-based boundaries for known classes
 
 ### Validation Phase  
-- Only uses **known classes** for model selection
-- Tunes energy threshold for OOD detection
-- Monitors classification accuracy and energy scores
+- Uses both **known and unknown classes** for model selection
+- Tunes energy threshold for OOD detection on real OOD data
+- Monitors classification accuracy, AUROC, and energy scores
 
 ### Testing Phase
 - Uses both **known and unknown classes**

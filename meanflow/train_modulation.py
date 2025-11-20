@@ -160,8 +160,8 @@ def parse_args():
                        help='Enable uncertainty-based auto-weighting for losses')
     parser.add_argument('--per_class_anchor', action='store_true', default=True,
                        help='Enable per-class threshold anchor to energy quantiles')
-    parser.add_argument('--eval_with_synthetic_negatives', action='store_true', default=True,
-                       help='On validation/test, compute OOD metrics using synthetic negatives from the loader if available')
+    parser.add_argument('--eval_with_synthetic_negatives', action='store_true', default=False,
+                       help='On validation/test, compute OOD metrics using synthetic negatives from the loader if available (disabled by default, uses real OOD data instead)')
     parser.add_argument('--anchor_quantile', type=float, default=0.2,
                        help='Quantile of per-class energy to anchor thresholds to')
     parser.add_argument('--anchor_delta', type=float, default=0.2,
@@ -578,7 +578,7 @@ def evaluate(
     # Find optimal energy threshold if not provided
     if energy_threshold is None and not args.use_learned_thresholds:
         if has_unknown:
-            # Test set: find threshold that maximizes F1 score
+            # Val/Test set with unknown classes: find threshold that maximizes F1 score
             thresholds = np.percentile(all_energies, np.linspace(0, 100, 100))
             best_f1 = 0
             best_threshold = thresholds[0]
@@ -598,7 +598,7 @@ def evaluate(
             energy_threshold = best_threshold
             logger.info(f'Optimal energy threshold: {energy_threshold:.4f} (F1: {best_f1:.4f})')
         else:
-            # Validation set: use target FPR on known samples only
+            # Dataset without unknown classes: use target FPR on known samples only
             if known_mask.sum() > 0:
                 # Set threshold to achieve target FPR (e.g., 5%)
                 target_fpr = getattr(args, 'target_fpr', 0.05)
@@ -1042,13 +1042,23 @@ def main():
                 val_metrics_wandb = {k.replace('eval/', 'val/'): v for k, v in val_metrics.items()}
                 wandb.log(val_metrics_wandb, step=epoch)
             
-            # Save checkpoint based on validation performance (use closed_set_accuracy since no unknowns in val)
-            is_best = val_metrics['eval/closed_set_accuracy'] > best_metric
+            # Save checkpoint based on validation performance
+            # Use AUROC if available (val has unknowns now), fallback to closed-set accuracy
+            if not np.isnan(val_metrics['eval/auroc']):
+                # Validation set has unknown classes - use AUROC for model selection
+                current_metric = val_metrics['eval/auroc']
+                metric_name = 'AUROC'
+            else:
+                # Fallback to closed-set accuracy if no unknowns present
+                current_metric = val_metrics['eval/closed_set_accuracy']
+                metric_name = 'Acc'
+            
+            is_best = current_metric > best_metric
             if is_best:
-                best_metric = val_metrics['eval/closed_set_accuracy']
-                logger.info(f'New best validation closed-set accuracy: {best_metric:.4f}')
+                best_metric = current_metric
+                logger.info(f'New best validation {metric_name}: {best_metric:.4f}')
                 # Update progress bar to show best performance
-                epoch_progress.set_description(f'Training Progress (Best Acc: {best_metric:.4f})')
+                epoch_progress.set_description(f'Training Progress (Best {metric_name}: {best_metric:.4f})')
             
             save_checkpoint(
                 model=model,

@@ -182,19 +182,32 @@ class RML2016Dataset(Dataset):
                 logger.info(f"Error:  {mod} is outer data from current dataset")
                 continue  # Skip if not in either list
             
-            # Calculate split indices
+            # Calculate split indices based on class type
             n_samples = signals.shape[0]  # Typically 1000 samples per (mod, SNR) pair
-            n_train = int(n_samples * self.train_split)  # 80% -> 800
-            n_val = int(n_samples * self.val_split)  # 10% -> 100
-            # Remaining samples go to test set (10% -> 100)
             
             # Randomly shuffle indices for train/val/test split
             indices = np.random.permutation(n_samples)
             
-            # Split indices
-            train_indices = indices[:n_train]
-            val_indices = indices[n_train:n_train + n_val]
-            test_indices = indices[n_train + n_val:]
+            # For known classes: 80% train, 10% val, 10% test
+            # For unknown classes: 0% train, 50% val, 50% test (to balance with known in val/test)
+            if not is_unk:
+                # Known class split
+                n_train = int(n_samples * self.train_split)  # 80% -> 800
+                n_val = int(n_samples * self.val_split)  # 10% -> 100
+                # Remaining samples go to test set (10% -> 100)
+                
+                train_indices = indices[:n_train]
+                val_indices = indices[n_train:n_train + n_val]
+                test_indices = indices[n_train + n_val:]
+            else:
+                # Unknown class split: only for val/test (no training)
+                # Split 50/50 between val and test for better balance
+                n_val = int(n_samples * 0.5)  # 50% -> 500
+                # Remaining 50% goes to test
+                
+                train_indices = []  # No training data for unknown
+                val_indices = indices[:n_val]
+                test_indices = indices[n_val:]
             
             # Select indices based on split type
             selected_indices = None
@@ -203,11 +216,10 @@ class RML2016Dataset(Dataset):
                 if not is_unk:
                     selected_indices = train_indices
             elif self.split == 'val':
-                # Validation set: only use known classes (exclude unknown)
-                if not is_unk:
-                    selected_indices = val_indices
+                # Validation set: use both known (10%) and unknown (50%)
+                selected_indices = val_indices
             else:  # test
-                # Test set: use both known and unknown classes
+                # Test set: use both known (10%) and unknown (50%)
                 selected_indices = test_indices
             
             # Add selected samples in batch for efficiency
@@ -593,9 +605,10 @@ def get_rml_dataloaders(
         train_loader, val_loader, test_loader
     
     Note:
-        - Training set: Contains only known classes (80% of data) with negative samples
-        - Validation set: Contains only known classes (10% of data) with negative samples
-        - Test set: Contains both known and unknown classes (10% of data) without negative samples
+        - Training set: Contains only known classes (80% of each known class) with negative samples
+        - Validation set: Contains known (10% of each known class) and unknown (50% of each unknown class)
+        - Test set: Contains known (10% of each known class) and unknown (50% of each unknown class)
+        - Unknown classes split 50/50 between val/test for better balance (not used in training)
     """
     # Create datasets
     train_dataset = RML2016Dataset(

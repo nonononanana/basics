@@ -553,7 +553,7 @@ class MeanFlowModulation(nn.Module):
             # Deterministic energy at evaluation to avoid metric noise
             if use_ema:
                 with torch.no_grad():
-                    e = torch.zeros_like(x)
+                    e = torch.randn_like(x)
                     t = torch.full((batch_size,), 0.5, device=device)
                     t_expanded = t.view(-1, 1, 1)
                     z = (1 - t_expanded) * x + t_expanded * e

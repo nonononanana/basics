@@ -719,29 +719,77 @@ def evaluate(
     )
     
     # Detection metrics
-    true_positive_rate = (unknown_mask & rejected).sum() / unknown_mask.sum() if unknown_mask.sum() > 0 else 0
-    false_positive_rate = (known_mask & rejected).sum() / known_mask.sum() if known_mask.sum() > 0 else 0
+    # Calculate TP, TN, FP, FN for OOD detection
+    # TP: Unknown correctly rejected
+    # TN: Known correctly classified (not rejected and correct prediction)
+    # FP: Known incorrectly rejected
+    # FN: Unknown incorrectly not rejected
     
-    # Calculate TKR (True Known Rate)
-    # TKR = TK / K = (Known samples not rejected) / Total known samples
-    tkr = (known_mask & ~rejected).sum() / known_mask.sum() if known_mask.sum() > 0 else 0
+    TP = (unknown_mask & rejected).sum()  # True Unknown (TU)
+    TN = (known_mask & ~rejected & (final_predictions == all_labels)).sum()  # True Known (TK)
+    FP = (known_mask & rejected).sum()  # False Unknown (FU) 
+    FN = (unknown_mask & ~rejected).sum()  # False Known (FK)
     
-    # Calculate F1-score for OOD detection (only if we have unknown samples)
+    # Calculate OA (Overall Accuracy) = (TP + TN) / (TP + TN + FP + FN)
+    total_samples = TP + TN + FP + FN
+    overall_accuracy = (TP + TN) / total_samples if total_samples > 0 else 0.0
+    
+    # Calculate F1-score = 2*TP / (2*TP + FP + FN)
     if has_unknown:
-        ood_f1 = f1_score(ood_labels, rejected)
+        f1_denominator = 2 * TP + FP + FN
+        ood_f1 = (2 * TP) / f1_denominator if f1_denominator > 0 else 0.0
     else:
         ood_f1 = 0.0  # No unknowns, F1 undefined
+    
+    # Calculate TKR (True Known Rate) = TK / K = TK / (TK + FU)
+    # K = total known samples
+    K = known_mask.sum()
+    TK = TN  # True Known = correctly classified known samples
+    FU = FP  # False Unknown = known samples incorrectly rejected
+    tkr = TK / K if K > 0 else 0.0
+    
+    # Calculate TUR (True Unknown Rate) = TU / U = TU / (TU + FK) 
+    # U = total unknown samples
+    U = unknown_mask.sum()
+    TU = TP  # True Unknown = correctly rejected unknown samples
+    FK = FN  # False Known = unknown samples incorrectly not rejected
+    tur = TU / U if U > 0 else 0.0
+    
+    # Also compute traditional metrics
+    true_positive_rate = TP / U if U > 0 else 0.0  # Same as TUR
+    false_positive_rate = FP / K if K > 0 else 0.0
 
     # Compile metrics
     metrics = {
-        'eval/OA (Open-Set Accuracy)': open_set_accuracy,
+        # Overall metrics using the formula OA = (TP + TN) / (TP + TN + FP + FN)
+        'eval/OA': overall_accuracy,
+        'eval/Open-Set Accuracy (legacy)': open_set_accuracy,  # Keep old metric for comparison
         'eval/closed_set_accuracy': closed_set_accuracy,
+        
+        # OOD detection metrics
         'eval/auroc': auroc,
         'eval/aupr': aupr,
-        'eval/F1_score_OOD': ood_f1,
+        
+        # F1-score using the formula F1 = 2*TP / (2*TP + FP + FN)
+        'eval/F1_score': ood_f1,
+        
+        # TKR using the formula TKR = TK / (TK + FU)
         'eval/TKR': tkr,
-        'eval/TUR (TPR)': true_positive_rate,
+        
+        # TUR using the formula TUR = TU / (TU + FK)
+        'eval/TUR': tur,
+        
+        # Traditional metrics
+        'eval/TPR': true_positive_rate,
         'eval/FPR': false_positive_rate,
+        
+        # Confusion matrix components
+        'eval/TP': float(TP),
+        'eval/TN': float(TN),
+        'eval/FP': float(FP),
+        'eval/FN': float(FN),
+        
+        # Threshold and energy stats
         'eval/energy_threshold': energy_threshold,
         'eval/mean_energy_known': all_energies[known_mask].mean() if known_mask.sum() > 0 else 0,
         'eval/mean_energy_unknown': all_energies[unknown_mask].mean() if unknown_mask.sum() > 0 else 0,

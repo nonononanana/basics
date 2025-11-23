@@ -325,10 +325,13 @@ class ModulationUNet(nn.Module):
         num_blocks: int = 2,  # Blocks per resolution
         dropout: float = 0.1,  # Dropout probability
         class_dropout: float = 0.1,  # Class label dropout for CFG
+        snr_dropout: float = 0.1,  # SNR dropout for CFG
         use_attention: bool = True,  # Whether to use attention
         attention_levels: Tuple[int, ...] = (2, 3),  # Which levels to apply attention
         embedding_type: str = 'positional',  # Time embedding type
-        class_embed_dim: int = 128  # Class embedding dimension
+        class_embed_dim: Optional[int] = None,  # Class embedding dimension (default: model_channels * 2)
+        use_snr_conditioning: bool = True,  # Whether to use SNR conditioning
+        snr_range: Tuple[float, float] = (-20.0, 20.0)  # SNR range for normalization (min, max) in dB
     ):
         """
         Initialize ModulationUNet
@@ -359,10 +362,17 @@ class ModulationUNet(nn.Module):
         self.num_blocks = num_blocks
         self.dropout = dropout
         self.class_dropout = class_dropout
-        self.class_embed_dim = class_embed_dim
+        self.snr_dropout = snr_dropout
+        self.use_snr_conditioning = use_snr_conditioning
+        self.snr_range = snr_range  # (min_snr, max_snr) in dB
         
         # Time embedding dimension
         time_embed_dim = model_channels * 4
+        
+        # Class embedding dimension: default to time_embed_dim / 2 = model_channels * 2
+        if class_embed_dim is None:
+            class_embed_dim = model_channels * 2
+        self.class_embed_dim = class_embed_dim
         
         # Time embedding
         if embedding_type == 'positional':
@@ -379,6 +389,17 @@ class ModulationUNet(nn.Module):
                 nn.SiLU(),
                 Linear(time_embed_dim, time_embed_dim)
             )
+        
+        # SNR embedding (Fourier + MLP, similar to time embedding)
+        if self.use_snr_conditioning:
+            self.snr_embed = nn.Sequential(
+                FourierEmbedding(num_channels=model_channels),
+                Linear(model_channels, time_embed_dim),
+                nn.SiLU(),
+                Linear(time_embed_dim, time_embed_dim)
+            )
+            # Dedicated null-SNR embedding for classifier-free guidance
+            self.null_snr_emb = nn.Parameter(torch.zeros(time_embed_dim))
         
         # Class embedding
         self.class_embed = nn.Embedding(num_classes, class_embed_dim)
@@ -501,7 +522,8 @@ class ModulationUNet(nn.Module):
         x: torch.Tensor,
         time_cond: Tuple[torch.Tensor, torch.Tensor],
         aug_cond: Optional[torch.Tensor] = None,
-        class_labels: Optional[torch.Tensor] = None
+        class_labels: Optional[torch.Tensor] = None,
+        snr_values: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Forward pass through the UNet
@@ -511,6 +533,7 @@ class ModulationUNet(nn.Module):
             time_cond: Time conditioning (t, h) tuple
             aug_cond: Augmentation conditioning (optional)
             class_labels: Class labels for conditioning
+            snr_values: SNR values for conditioning [batch] in dB
         
         Returns:
             Output signal [batch, 2, 128]
@@ -530,6 +553,26 @@ class ModulationUNet(nn.Module):
         # Compute time embedding
         # Combine t and h for time embedding
         time_emb = self.time_embed(t) + self.time_embed(h)
+        
+        # Add SNR embedding if provided and enabled
+        if self.use_snr_conditioning and snr_values is not None:
+            # Normalize SNR to [-1, 1] range using actual data range
+            snr_min, snr_max = self.snr_range
+            snr_center = (snr_max + snr_min) / 2.0
+            snr_scale = (snr_max - snr_min) / 2.0
+            snr_normalized = (snr_values - snr_center) / snr_scale  # [-1, 1] range
+            snr_emb = self.snr_embed(snr_normalized)
+            
+            # Apply classifier-free guidance for SNR
+            if self.training and self.snr_dropout > 0:
+                drop_mask = (torch.rand(snr_values.shape[0], device=x.device) < self.snr_dropout)
+                if drop_mask.any():
+                    snr_emb = snr_emb.clone()
+                    null_row = self.null_snr_emb.to(dtype=snr_emb.dtype, device=snr_emb.device).unsqueeze(0)
+                    snr_emb[drop_mask] = null_row.expand(snr_emb[drop_mask].shape[0], -1)
+            
+            # Add to time embedding
+            time_emb = time_emb + snr_emb
         
         # Add class embedding if provided
         if class_labels is not None:
@@ -594,7 +637,8 @@ class ModulationUNet(nn.Module):
         x: torch.Tensor,
         time_cond: Tuple[torch.Tensor, torch.Tensor],
         aug_cond: Optional[torch.Tensor] = None,
-        class_labels: Optional[torch.Tensor] = None
+        class_labels: Optional[torch.Tensor] = None,
+        snr_values: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Compute sample-dependent representation vector from the network, without
@@ -615,6 +659,21 @@ class ModulationUNet(nn.Module):
 
         # Compute time embedding
         time_emb = self.time_embed(t) + self.time_embed(h)
+
+        # Add SNR embedding if provided and enabled
+        if self.use_snr_conditioning and snr_values is not None:
+            snr_min, snr_max = self.snr_range
+            snr_center = (snr_max + snr_min) / 2.0
+            snr_scale = (snr_max - snr_min) / 2.0
+            snr_normalized = (snr_values - snr_center) / snr_scale  # [-1, 1] range
+            snr_emb = self.snr_embed(snr_normalized)
+            if self.training and self.snr_dropout > 0:
+                drop_mask = (torch.rand(snr_values.shape[0], device=x.device) < self.snr_dropout)
+                if drop_mask.any():
+                    snr_emb = snr_emb.clone()
+                    null_row = self.null_snr_emb.to(dtype=snr_emb.dtype, device=snr_emb.device).unsqueeze(0)
+                    snr_emb[drop_mask] = null_row.expand(snr_emb[drop_mask].shape[0], -1)
+            time_emb = time_emb + snr_emb
 
         # Optionally add class embedding
         if class_labels is not None:

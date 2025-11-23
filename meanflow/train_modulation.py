@@ -223,12 +223,13 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def create_model(args) -> MeanFlowModulation:
+def create_model(args, snr_range=(-20, 20)) -> MeanFlowModulation:
     """
     Create the Mean Flow model for modulation classification
     
     Args:
         args: Command line arguments
+        snr_range: Tuple of (min_snr, max_snr) from dataset
     
     Returns:
         MeanFlowModulation model
@@ -250,7 +251,8 @@ def create_model(args) -> MeanFlowModulation:
         'use_attention': True,
         'attention_levels': (2, 3),
         'embedding_type': 'positional',
-        'class_embed_dim': 128
+        'use_snr_conditioning': True,
+        'snr_range': snr_range  # Pass actual SNR range from data
     }
     
     # Create Mean Flow model
@@ -322,6 +324,11 @@ def train_epoch(
             neg_samples = neg_samples.to(args.device, non_blocking=True)
         labels = labels.to(args.device, non_blocking=True)
         
+        # Extract SNR values from info dict
+        snr_values = info.get('snr', None)
+        if snr_values is not None:
+            snr_values = snr_values.to(args.device, non_blocking=True)
+        
         # Zero gradients
         optimizer.zero_grad()
         
@@ -332,6 +339,7 @@ def train_epoch(
                     x_pos=pos_samples,
                     x_neg=neg_samples,
                     class_labels=labels,
+                    snr_values=snr_values,
                     aug_cond=None,
                     lambda_rec=args.lambda_rec,
                     lambda_arc=args.lambda_arc,
@@ -364,6 +372,7 @@ def train_epoch(
                 x_pos=pos_samples,
                 x_neg=neg_samples,
                 class_labels=labels,
+                snr_values=snr_values,
                 aug_cond=None,
                 lambda_rec=args.lambda_rec,
                 lambda_arc=args.lambda_arc,
@@ -493,19 +502,24 @@ def evaluate(
             labels = labels.to(args.device)
             is_unknown = info['is_unknown']
             
+            # Extract SNR values from info dict
+            snr_values = info.get('snr', None)
+            if snr_values is not None:
+                snr_values = snr_values.to(args.device)
+            
             # Compute class energies and predictions without rejection
-            class_energies = model.compute_energy_score(signals, return_per_class=True, use_ema=True)
+            class_energies = model.compute_energy_score(signals, return_per_class=True, use_ema=True, snr_values=snr_values)
             predictions = class_energies.argmin(dim=1)
 
             # Compute OOD energy-like scores
             if args.use_learned_thresholds:
                 # Use learned thresholds to form scores but don't use their rejection yet
-                _, best_scores, _ = model.classify_with_learned_threshold(signals, use_ema=True)
+                _, best_scores, _ = model.classify_with_learned_threshold(signals, use_ema=True, snr_values=snr_values)
                 # Higher values should mean more OOD for AUROC/AUPR, so negate best_scores
                 energy_scores = -best_scores
                 all_best_scores.append(best_scores.cpu())
             else:
-                energy_scores = model.compute_energy_score(signals, use_ema=True)
+                energy_scores = model.compute_energy_score(signals, use_ema=True, snr_values=snr_values)
             
             # Store results
             all_predictions.append(predictions.cpu())
@@ -517,13 +531,14 @@ def evaluate(
             # Optionally evaluate synthetic negatives as OOD for val/test
             if args.eval_with_synthetic_negatives and neg_samples is not None:
                 neg_signals = neg_samples.to(args.device)
+                # Use same SNR for negative samples (they come from corrupting positives)
                 if args.use_learned_thresholds:
-                    _, neg_best_scores, _ = model.classify_with_learned_threshold(neg_signals, use_ema=True)
+                    _, neg_best_scores, _ = model.classify_with_learned_threshold(neg_signals, use_ema=True, snr_values=snr_values)
                     neg_scores = -neg_best_scores  # higher = more OOD
                     # Keep arrays aligned: append synthetic negatives' best scores
                     all_best_scores.append(neg_best_scores.cpu())
                 else:
-                    neg_scores = model.compute_energy_score(neg_signals, use_ema=True)
+                    neg_scores = model.compute_energy_score(neg_signals, use_ema=True, snr_values=snr_values)
                 # Append as unknowns
                 all_predictions.append(torch.full((neg_signals.shape[0],), -1, dtype=torch.long))
                 all_labels.append(torch.full((neg_signals.shape[0],), -1, dtype=torch.long))
@@ -968,11 +983,16 @@ def main():
         test_split=0.1,
         normalize=args.normalize,
         seed=args.seed,
-        precompute_negatives=False
+        precompute_negatives=False,
+        return_snr=True  # Enable SNR conditioning
     )
     
-    # Create model
-    model = create_model(args)
+    # Get actual SNR range from dataset
+    actual_snr_range = (args.snr_min, args.snr_max)
+    logger.info(f'Using SNR range for normalization: {actual_snr_range}')
+    
+    # Create model with actual SNR range
+    model = create_model(args, snr_range=actual_snr_range)
     model.to(args.device)
     
     # Log model parameters

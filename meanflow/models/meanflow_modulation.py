@@ -236,6 +236,7 @@ class MeanFlowModulation(nn.Module):
         x_pos: torch.Tensor,
         x_neg: Optional[torch.Tensor], 
         class_labels: torch.Tensor,
+        snr_values: Optional[torch.Tensor] = None,
         aug_cond: Optional[torch.Tensor] = None,
         lambda_rec: float = 1.0,
         lambda_arc: float = 5.0,
@@ -256,6 +257,7 @@ class MeanFlowModulation(nn.Module):
             x_pos: Positive (original) signal data [batch_size, 2, 128] (I/Q channels)
             x_neg: Negative (corrupted) signal data [batch_size, 2, 128] or None
             class_labels: Modulation class labels [batch_size]
+            snr_values: SNR values [batch_size] in dB
             aug_cond: Optional augmentation conditioning
             lambda_rec: Weight for reconstruction loss
             lambda_arc: Weight for ArcFace loss
@@ -289,15 +291,16 @@ class MeanFlowModulation(nn.Module):
         # Get class embeddings for conditioning
         class_embeds = self.get_class_embeddings(class_labels)
         
-        # Define network function with class conditioning
+        # Define network function with class and SNR conditioning
         def u_func(z, t, r):
             h = t - r
-            # Pass class labels to network for conditioning
+            # Pass class labels and SNR to network for conditioning
             return self.net(
                 z, 
                 (t.view(-1), h.view(-1)), 
                 aug_cond,
-                class_labels=class_labels  # Pass class labels for conditioning
+                class_labels=class_labels,  # Pass class labels for conditioning
+                snr_values=snr_values  # Pass SNR values for conditioning
             )
         
         # Compute derivatives for mean flow
@@ -329,7 +332,8 @@ class MeanFlowModulation(nn.Module):
                 x=x_pos,
                 time_cond=(t.view(-1), (t - r).view(-1)),
                 aug_cond=aug_cond,
-                class_labels=class_labels
+                class_labels=class_labels,
+                snr_values=snr_values
             )  # [batch, class_embed_dim]
             valid_mask = class_labels >= 0
             if valid_mask.any():
@@ -481,6 +485,7 @@ class MeanFlowModulation(nn.Module):
         self, 
         samples_shape: Tuple[int, ...],
         class_labels: Optional[torch.Tensor] = None,
+        snr_values: Optional[torch.Tensor] = None,
         net: Optional[nn.Module] = None,
         device: Optional[torch.device] = None
     ) -> torch.Tensor:
@@ -490,6 +495,7 @@ class MeanFlowModulation(nn.Module):
         Args:
             samples_shape: Shape of samples to generate
             class_labels: Class labels for conditional generation
+            snr_values: SNR values for conditional generation [batch] in dB
             net: Network to use (default: self.net_ema)
             device: Device to generate on
         
@@ -507,13 +513,13 @@ class MeanFlowModulation(nn.Module):
         t = torch.ones(batch_size, device=device)
         r = torch.zeros(batch_size, device=device)
         
-        # Generate with class conditioning if provided
+        # Generate with class and SNR conditioning if provided
         if class_labels is not None:
-            u = net(z_1, (t, t - r), aug_cond=None, class_labels=class_labels)
+            u = net(z_1, (t, t - r), aug_cond=None, class_labels=class_labels, snr_values=snr_values)
         else:
             # Unconditional generation (sample random classes)
             random_labels = torch.randint(0, self.num_classes, (batch_size,), device=device)
-            u = net(z_1, (t, t - r), aug_cond=None, class_labels=random_labels)
+            u = net(z_1, (t, t - r), aug_cond=None, class_labels=random_labels, snr_values=snr_values)
         
         # Final sample
         z_0 = z_1 - u
@@ -524,7 +530,8 @@ class MeanFlowModulation(nn.Module):
         self,
         x: torch.Tensor,
         return_per_class: bool = False,
-        use_ema: bool = True
+        use_ema: bool = True,
+        snr_values: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Compute energy score for OOD detection
@@ -535,6 +542,7 @@ class MeanFlowModulation(nn.Module):
             x: Input signal [batch_size, 2, 128]
             return_per_class: If True, return energy for each class
             use_ema: If True, use EMA network (for evaluation), else use main network (for training)
+            snr_values: SNR values [batch_size] in dB (optional)
         
         Returns:
             Energy scores [batch_size] or [batch_size, num_classes]
@@ -561,7 +569,8 @@ class MeanFlowModulation(nn.Module):
                         z,
                         (t, t),
                         aug_cond=None,
-                        class_labels=class_labels
+                        class_labels=class_labels,
+                        snr_values=snr_values
                     )
                     x_recon = z - t_expanded * u
                     error = (x - x_recon)**2
@@ -577,7 +586,8 @@ class MeanFlowModulation(nn.Module):
                     z,
                     (t, t),
                     aug_cond=None,
-                    class_labels=class_labels
+                    class_labels=class_labels,
+                    snr_values=snr_values
                 )
                 x_recon = z - t_expanded * u
                 error = (x - x_recon)**2
@@ -599,7 +609,8 @@ class MeanFlowModulation(nn.Module):
     def compute_classification_logits(
         self,
         x: torch.Tensor,
-        use_ema: bool = True
+        use_ema: bool = True,
+        snr_values: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Compute per-class classification logits using per-class energies and
@@ -617,7 +628,8 @@ class MeanFlowModulation(nn.Module):
     def classify_with_learned_threshold(
         self,
         x: torch.Tensor,
-        use_ema: bool = True
+        use_ema: bool = True,
+        snr_values: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Classify with per-class thresholds. Predicts the class with highest
@@ -625,7 +637,7 @@ class MeanFlowModulation(nn.Module):
 
         Returns: predictions, scores, per_class_energies
         """
-        per_class_energies = self.compute_energy_score(x, return_per_class=True, use_ema=use_ema)
+        per_class_energies = self.compute_energy_score(x, return_per_class=True, use_ema=use_ema, snr_values=snr_values)
         scores = self.class_thresholds.view(1, -1) - per_class_energies
         best_scores, preds = scores.max(dim=1)
         reject_mask = best_scores < 0
@@ -636,7 +648,8 @@ class MeanFlowModulation(nn.Module):
     def classify_with_rejection(
         self,
         x: torch.Tensor,
-        energy_threshold: float = 0.5
+        energy_threshold: float = 0.5,
+        snr_values: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Classify input with rejection option for unknown classes
@@ -651,7 +664,7 @@ class MeanFlowModulation(nn.Module):
             class_energies: Energy for each class [batch_size, num_classes]
         """
         # Compute energy for each class
-        class_energies = self.compute_energy_score(x, return_per_class=True)
+        class_energies = self.compute_energy_score(x, return_per_class=True, snr_values=snr_values)
         
         # Find minimum energy class (best match)
         min_energies, predictions = class_energies.min(dim=1)

@@ -63,12 +63,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def create_model(args) -> MeanFlowModulation:
+def create_model(args, snr_range=(-20, 20)) -> MeanFlowModulation:
     """
     Create the Mean Flow model for modulation classification
     
     Args:
         args: Command line arguments
+        snr_range: Tuple of (min_snr, max_snr) from dataset
     
     Returns:
         MeanFlowModulation model
@@ -90,7 +91,9 @@ def create_model(args) -> MeanFlowModulation:
         'use_attention': True,
         'attention_levels': (2, 3),
         'embedding_type': 'positional',
-        'class_embed_dim': 128
+        'class_embed_dim': None,  # Will default to model_channels * 2
+        'use_snr_conditioning': True,
+        'snr_range': snr_range  # Pass actual SNR range from data
     }
     
     # Create Mean Flow model
@@ -108,13 +111,14 @@ def create_model(args) -> MeanFlowModulation:
     return model
 
 
-def load_checkpoint(checkpoint_path: str, device: torch.device) -> Tuple[nn.Module, object]:
+def load_checkpoint(checkpoint_path: str, device: torch.device, snr_range=(-20, 20)) -> Tuple[nn.Module, object]:
     """
     Load checkpoint and create model
     
     Args:
         checkpoint_path: Path to checkpoint file
         device: Device to load model on
+        snr_range: Tuple of (min_snr, max_snr) from dataset
     
     Returns:
         model: Loaded model in eval mode
@@ -128,8 +132,8 @@ def load_checkpoint(checkpoint_path: str, device: torch.device) -> Tuple[nn.Modu
     if args is None:
         raise ValueError("Checkpoint does not contain 'args'. Cannot recreate model.")
     
-    # Create model using saved args
-    model = create_model(args)
+    # Create model using saved args and actual SNR range
+    model = create_model(args, snr_range=snr_range)
     model.to(device)
     
     # Load model state
@@ -170,22 +174,34 @@ def collect_real_samples(
     dataset: RML2016Dataset,
     class_idx: int,
     num_samples: int,
-    device: torch.device
+    device: torch.device,
+    snr_value: Optional[float] = None
 ) -> torch.Tensor:
     """
-    Collect real samples for a specific class
+    Collect real samples for a specific class and SNR
     
     Args:
         dataset: RML2016Dataset instance
         class_idx: Class index to collect samples for
         num_samples: Number of samples to collect
         device: Device to move samples to
+        snr_value: SNR value in dB to filter by (optional)
     
     Returns:
         Tensor of shape [num_samples, 2, 128]
     """
     samples = []
+    
+    # Filter by class
     indices = np.where(dataset.labels == class_idx)[0]
+    
+    # Further filter by SNR if specified
+    if snr_value is not None and hasattr(dataset, 'snr_labels'):
+        # Get SNR labels for these indices
+        snr_labels = dataset.snr_labels[indices]
+        # Find samples matching the SNR value
+        snr_mask = (snr_labels == snr_value)
+        indices = indices[snr_mask]
     
     if len(indices) < num_samples:
         logger.warning(f"Only {len(indices)} samples available for class {class_idx}, requested {num_samples}")
@@ -206,10 +222,11 @@ def generate_samples(
     class_idx: int,
     num_samples: int,
     batch_size: int,
-    device: torch.device
+    device: torch.device,
+    snr_value: Optional[float] = None
 ) -> torch.Tensor:
     """
-    Generate samples for a specific class
+    Generate samples for a specific class and SNR
     
     Args:
         model: MeanFlowModulation model
@@ -217,6 +234,7 @@ def generate_samples(
         num_samples: Number of samples to generate
         batch_size: Batch size for generation
         device: Device to generate on
+        snr_value: SNR value in dB (optional)
     
     Returns:
         Tensor of shape [num_samples, 2, 128]
@@ -229,9 +247,15 @@ def generate_samples(
             current_batch_size = min(batch_size, num_samples - i)
             class_labels = torch.full((current_batch_size,), class_idx, dtype=torch.long, device=device)
             
+            # Create SNR tensor if provided
+            snr_tensor = None
+            if snr_value is not None:
+                snr_tensor = torch.full((current_batch_size,), snr_value, dtype=torch.float32, device=device)
+            
             generated = model.sample(
                 samples_shape=(current_batch_size, 2, 128),
                 class_labels=class_labels,
+                snr_values=snr_tensor,
                 device=device
             )
             samples.append(generated.cpu())
@@ -573,30 +597,43 @@ def evaluate_generative_quality(
     device: torch.device = None,
     metrics: List[str] = None,
     create_plots: bool = True,
-    output_dir: Path = None
+    output_dir: Path = None,
+    snr_levels: List[float] = None
 ) -> Dict:
     """
-    Main evaluation function
+    Main evaluation function with per-SNR evaluation
     
     Args:
         model: MeanFlowModulation model
         dataset: RML2016Dataset test split
         args: Training arguments
-        num_samples_per_class: Number of samples to generate per class
+        num_samples_per_class: Number of samples to generate per class per SNR
         batch_size: Batch size for generation
         device: Device
         metrics: List of metrics to compute ['mmd', 'c2st', 'fid', 'psd', 'hist']
         create_plots: Whether to create visualization plots
         output_dir: Output directory
+        snr_levels: List of SNR values to evaluate (default: [-10, 0, 10, 18])
     
     Returns:
-        Dictionary with all metrics
+        Dictionary with all metrics including per-SNR breakdown
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     if metrics is None:
         metrics = ['mmd', 'c2st', 'fid', 'psd', 'hist']
+    
+    # Default SNR levels: low (-10), medium (0, 10), high (18)
+    if snr_levels is None:
+        snr_levels = [-10, 0, 10, 18]
+    
+    # Categorize SNR levels into low/medium/high
+    snr_categories = {
+        'low': [s for s in snr_levels if s < -5],
+        'medium': [s for s in snr_levels if -5 <= s <= 15],
+        'high': [s for s in snr_levels if s > 15]
+    }
     
     if output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -612,141 +649,220 @@ def evaluate_generative_quality(
     
     logger.info(f"Evaluating generative quality for {num_classes} classes")
     logger.info(f"Classes: {known_classes}")
-    logger.info(f"Generating {num_samples_per_class} samples per class")
+    logger.info(f"SNR levels: {snr_levels}")
+    logger.info(f"Generating {num_samples_per_class} samples per class per SNR")
     
     all_metrics = {}
     per_class_metrics = {}
+    per_snr_metrics = {}
+    per_class_per_snr_metrics = {}
     
-    # Flatten samples for global metrics
-    all_real = []
-    all_gen = []
+    # Store samples for aggregated metrics
+    all_real_per_snr = {snr: [] for snr in snr_levels}
+    all_gen_per_snr = {snr: [] for snr in snr_levels}
     
-    # Evaluate per class
+    # Evaluate per class and per SNR
     for class_idx in range(num_classes):
         class_name = known_classes[class_idx]
         logger.info(f"\n{'='*60}")
         logger.info(f"Evaluating class {class_idx}: {class_name}")
         logger.info(f"{'='*60}")
         
-        # Collect real samples
-        logger.info("Collecting real samples...")
-        real_samples = collect_real_samples(dataset, class_idx, num_samples_per_class, device)
-        real_np = real_samples.cpu().numpy()
+        per_class_per_snr_metrics[class_name] = {}
         
-        # Generate samples
-        logger.info("Generating samples...")
-        gen_samples = generate_samples(model, class_idx, num_samples_per_class, batch_size, device)
-        gen_np = gen_samples.cpu().numpy()
+        # Evaluate for each SNR level
+        for snr_value in snr_levels:
+            logger.info(f"\n--- SNR: {snr_value} dB ---")
+            
+            # Collect real samples at this SNR
+            logger.info(f"Collecting real samples at SNR {snr_value} dB...")
+            real_samples = collect_real_samples(dataset, class_idx, num_samples_per_class, device, snr_value=snr_value)
+            real_np = real_samples.cpu().numpy()
+            
+            # Generate samples at this SNR
+            logger.info(f"Generating samples at SNR {snr_value} dB...")
+            gen_samples = generate_samples(model, class_idx, num_samples_per_class, batch_size, device, snr_value=snr_value)
+            gen_np = gen_samples.cpu().numpy()
+            
+            # Store for SNR-aggregated metrics
+            all_real_per_snr[snr_value].append(real_np)
+            all_gen_per_snr[snr_value].append(gen_np)
         
-        # Store for global metrics
-        all_real.append(real_np)
-        all_gen.append(gen_np)
+            # Compute metrics for this class-SNR combination
+            snr_class_metrics = {}
+            
+            # Flatten for MMD and C2ST
+            real_flat = real_np.reshape(len(real_np), -1)
+            gen_flat = gen_np.reshape(len(gen_np), -1)
+            
+            if 'mmd' in metrics:
+                logger.info("Computing MMD...")
+                mmd = compute_mmd(real_flat, gen_flat)
+                snr_class_metrics['mmd'] = mmd
+                logger.info(f"MMD: {mmd:.6f}")
+            
+            if 'c2st' in metrics:
+                logger.info("Computing C2ST...")
+                c2st = compute_c2st_accuracy(real_flat, gen_flat)
+                snr_class_metrics['c2st_accuracy'] = c2st
+                logger.info(f"C2ST Accuracy: {c2st:.4f}")
+            
+            if 'fid' in metrics:
+                logger.info("Computing FID-like...")
+                try:
+                    fid = compute_fid_like(model, real_samples, gen_samples, device, class_idx=class_idx)
+                    snr_class_metrics['fid'] = fid
+                    logger.info(f"FID-like: {fid:.6f}")
+                except Exception as e:
+                    logger.warning(f"FID computation failed: {e}")
+            
+            if 'psd' in metrics:
+                logger.info("Computing PSD distance...")
+                psd_dist = compute_psd_distance(real_np, gen_np)
+                snr_class_metrics['psd_distance'] = psd_dist
+                logger.info(f"PSD Distance: {psd_dist:.6f}")
+            
+            if 'hist' in metrics:
+                logger.info("Computing histogram distances...")
+                hist_dists = compute_histogram_distance(real_np, gen_np)
+                snr_class_metrics.update(hist_dists)
+                logger.info(f"Amplitude JS: {hist_dists['amplitude_js']:.6f}")
+                logger.info(f"Phase JS: {hist_dists['phase_js']:.6f}")
+            
+            per_class_per_snr_metrics[class_name][f'snr_{snr_value}'] = snr_class_metrics
+            
+            # Create visualizations for key SNR levels
+            if create_plots and snr_value in [-10, 0, 18]:
+                logger.info("Creating visualizations...")
+                create_visualizations(real_np, gen_np, f"{class_name}_snr{snr_value}", output_dir / "plots")
+    
+    # Compute per-SNR aggregated metrics
+    logger.info(f"\n{'='*60}")
+    logger.info("Computing per-SNR aggregated metrics...")
+    logger.info(f"{'='*60}")
+    
+    for snr_value in snr_levels:
+        logger.info(f"\n--- Aggregated metrics for SNR {snr_value} dB ---")
         
-        # Compute metrics
-        class_metrics = {}
+        snr_real_np = np.vstack(all_real_per_snr[snr_value])
+        snr_gen_np = np.vstack(all_gen_per_snr[snr_value])
+        snr_real_flat = snr_real_np.reshape(len(snr_real_np), -1)
+        snr_gen_flat = snr_gen_np.reshape(len(snr_gen_np), -1)
         
-        # Flatten for MMD and C2ST
-        real_flat = real_np.reshape(len(real_np), -1)
-        gen_flat = gen_np.reshape(len(gen_np), -1)
+        snr_metrics = {}
         
         if 'mmd' in metrics:
             logger.info("Computing MMD...")
-            mmd = compute_mmd(real_flat, gen_flat)
-            class_metrics['mmd'] = mmd
-            logger.info(f"MMD: {mmd:.6f}")
+            snr_mmd = compute_mmd(snr_real_flat, snr_gen_flat)
+            snr_metrics['mmd'] = snr_mmd
+            logger.info(f"MMD: {snr_mmd:.6f}")
         
         if 'c2st' in metrics:
             logger.info("Computing C2ST...")
-            c2st = compute_c2st_accuracy(real_flat, gen_flat)
-            class_metrics['c2st_accuracy'] = c2st
-            logger.info(f"C2ST Accuracy: {c2st:.4f}")
+            snr_c2st = compute_c2st_accuracy(snr_real_flat, snr_gen_flat)
+            snr_metrics['c2st_accuracy'] = snr_c2st
+            logger.info(f"C2ST Accuracy: {snr_c2st:.4f}")
         
         if 'fid' in metrics:
             logger.info("Computing FID-like...")
             try:
-                fid = compute_fid_like(model, real_samples, gen_samples, device, class_idx=class_idx)
-                class_metrics['fid'] = fid
-                logger.info(f"FID-like: {fid:.6f}")
+                snr_real_tensor = torch.from_numpy(snr_real_np).to(device)
+                snr_gen_tensor = torch.from_numpy(snr_gen_np).to(device)
+                snr_fid = compute_fid_like(model, snr_real_tensor, snr_gen_tensor, device, class_idx=0)
+                snr_metrics['fid'] = snr_fid
+                logger.info(f"FID-like: {snr_fid:.6f}")
             except Exception as e:
                 logger.warning(f"FID computation failed: {e}")
         
         if 'psd' in metrics:
             logger.info("Computing PSD distance...")
-            psd_dist = compute_psd_distance(real_np, gen_np)
-            class_metrics['psd_distance'] = psd_dist
-            logger.info(f"PSD Distance: {psd_dist:.6f}")
+            snr_psd = compute_psd_distance(snr_real_np, snr_gen_np)
+            snr_metrics['psd_distance'] = snr_psd
+            logger.info(f"PSD Distance: {snr_psd:.6f}")
         
         if 'hist' in metrics:
             logger.info("Computing histogram distances...")
-            hist_dists = compute_histogram_distance(real_np, gen_np)
-            class_metrics.update(hist_dists)
-            logger.info(f"Amplitude JS: {hist_dists['amplitude_js']:.6f}")
-            logger.info(f"Phase JS: {hist_dists['phase_js']:.6f}")
+            snr_hist = compute_histogram_distance(snr_real_np, snr_gen_np)
+            snr_metrics.update(snr_hist)
+            logger.info(f"Amplitude JS: {snr_hist['amplitude_js']:.6f}")
+            logger.info(f"Phase JS: {snr_hist['phase_js']:.6f}")
         
-        per_class_metrics[class_name] = class_metrics
-        
-        # Create visualizations
-        if create_plots:
-            logger.info("Creating visualizations...")
-            create_visualizations(real_np, gen_np, class_name, output_dir / "plots")
+        per_snr_metrics[f'snr_{snr_value}'] = snr_metrics
     
-    # Compute global metrics
+    # Compute category-level metrics (low/medium/high SNR)
     logger.info(f"\n{'='*60}")
-    logger.info("Computing global metrics...")
+    logger.info("Computing SNR category metrics...")
     logger.info(f"{'='*60}")
     
-    all_real_np = np.vstack(all_real)
-    all_gen_np = np.vstack(all_gen)
-    all_real_flat = all_real_np.reshape(len(all_real_np), -1)
-    all_gen_flat = all_gen_np.reshape(len(all_gen_np), -1)
-    
-    global_metrics = {}
-    
-    if 'mmd' in metrics:
-        logger.info("Computing global MMD...")
-        global_mmd = compute_mmd(all_real_flat, all_gen_flat)
-        global_metrics['mmd'] = global_mmd
-        logger.info(f"Global MMD: {global_mmd:.6f}")
-    
-    if 'c2st' in metrics:
-        logger.info("Computing global C2ST...")
-        global_c2st = compute_c2st_accuracy(all_real_flat, all_gen_flat)
-        global_metrics['c2st_accuracy'] = global_c2st
-        logger.info(f"Global C2ST Accuracy: {global_c2st:.4f}")
-    
-    if 'fid' in metrics:
-        logger.info("Computing global FID-like...")
-        try:
-            import scipy.linalg
-            all_real_tensor = torch.from_numpy(all_real_np).to(device)
-            all_gen_tensor = torch.from_numpy(all_gen_np).to(device)
-            # For global FID, use class 0 as default (or could compute per-class and average)
-            global_fid = compute_fid_like(model, all_real_tensor, all_gen_tensor, device, class_idx=0)
-            global_metrics['fid'] = global_fid
-            logger.info(f"Global FID-like: {global_fid:.6f}")
-        except Exception as e:
-            logger.warning(f"Global FID computation failed: {e}")
-    
-    if 'psd' in metrics:
-        logger.info("Computing global PSD distance...")
-        global_psd = compute_psd_distance(all_real_np, all_gen_np)
-        global_metrics['psd_distance'] = global_psd
-        logger.info(f"Global PSD Distance: {global_psd:.6f}")
-    
-    if 'hist' in metrics:
-        logger.info("Computing global histogram distances...")
-        global_hist = compute_histogram_distance(all_real_np, all_gen_np)
-        global_metrics.update(global_hist)
-        logger.info(f"Global Amplitude JS: {global_hist['amplitude_js']:.6f}")
-        logger.info(f"Global Phase JS: {global_hist['phase_js']:.6f}")
+    category_metrics = {}
+    for category, snr_list in snr_categories.items():
+        if not snr_list:
+            continue
+        
+        logger.info(f"\n--- Category: {category.upper()} SNR ({snr_list}) ---")
+        
+        # Aggregate samples from all SNRs in this category
+        cat_real_list = []
+        cat_gen_list = []
+        for snr in snr_list:
+            cat_real_list.extend(all_real_per_snr[snr])
+            cat_gen_list.extend(all_gen_per_snr[snr])
+        
+        cat_real_np = np.vstack(cat_real_list)
+        cat_gen_np = np.vstack(cat_gen_list)
+        cat_real_flat = cat_real_np.reshape(len(cat_real_np), -1)
+        cat_gen_flat = cat_gen_np.reshape(len(cat_gen_np), -1)
+        
+        cat_metrics = {}
+        
+        if 'mmd' in metrics:
+            logger.info("Computing MMD...")
+            cat_mmd = compute_mmd(cat_real_flat, cat_gen_flat)
+            cat_metrics['mmd'] = cat_mmd
+            logger.info(f"MMD: {cat_mmd:.6f}")
+        
+        if 'c2st' in metrics:
+            logger.info("Computing C2ST...")
+            cat_c2st = compute_c2st_accuracy(cat_real_flat, cat_gen_flat)
+            cat_metrics['c2st_accuracy'] = cat_c2st
+            logger.info(f"C2ST Accuracy: {cat_c2st:.4f}")
+        
+        if 'fid' in metrics:
+            logger.info("Computing FID-like...")
+            try:
+                cat_real_tensor = torch.from_numpy(cat_real_np).to(device)
+                cat_gen_tensor = torch.from_numpy(cat_gen_np).to(device)
+                cat_fid = compute_fid_like(model, cat_real_tensor, cat_gen_tensor, device, class_idx=0)
+                cat_metrics['fid'] = cat_fid
+                logger.info(f"FID-like: {cat_fid:.6f}")
+            except Exception as e:
+                logger.warning(f"FID computation failed: {e}")
+        
+        if 'psd' in metrics:
+            logger.info("Computing PSD distance...")
+            cat_psd = compute_psd_distance(cat_real_np, cat_gen_np)
+            cat_metrics['psd_distance'] = cat_psd
+            logger.info(f"PSD Distance: {cat_psd:.6f}")
+        
+        if 'hist' in metrics:
+            logger.info("Computing histogram distances...")
+            cat_hist = compute_histogram_distance(cat_real_np, cat_gen_np)
+            cat_metrics.update(cat_hist)
+            logger.info(f"Amplitude JS: {cat_hist['amplitude_js']:.6f}")
+            logger.info(f"Phase JS: {cat_hist['phase_js']:.6f}")
+        
+        category_metrics[category] = cat_metrics
     
     # Compile results
     all_metrics = {
         'experiment_setting': experiment_setting,
         'known_classes': known_classes,
         'num_samples_per_class': num_samples_per_class,
-        'per_class_metrics': per_class_metrics,
-        'global_metrics': global_metrics
+        'snr_levels': snr_levels,
+        'snr_categories': snr_categories,
+        'per_class_per_snr_metrics': per_class_per_snr_metrics,
+        'per_snr_aggregated_metrics': per_snr_metrics,
+        'category_metrics': category_metrics
     }
     
     # Save results
@@ -759,15 +875,27 @@ def evaluate_generative_quality(
     logger.info(f"\n{'='*60}")
     logger.info("SUMMARY")
     logger.info(f"{'='*60}")
-    logger.info("\nPer-Class Metrics:")
-    for class_name, metrics_dict in per_class_metrics.items():
-        logger.info(f"\n{class_name}:")
+    
+    logger.info("\n=== SNR Category Metrics (High/Medium/Low) ===")
+    for category in ['low', 'medium', 'high']:
+        if category in category_metrics:
+            logger.info(f"\n{category.upper()} SNR:")
+            for metric_name, value in category_metrics[category].items():
+                logger.info(f"  {metric_name}: {value:.6f}")
+    
+    logger.info("\n=== Per-SNR Aggregated Metrics ===")
+    for snr_key, metrics_dict in per_snr_metrics.items():
+        logger.info(f"\n{snr_key}:")
         for metric_name, value in metrics_dict.items():
             logger.info(f"  {metric_name}: {value:.6f}")
     
-    logger.info("\nGlobal Metrics:")
-    for metric_name, value in global_metrics.items():
-        logger.info(f"  {metric_name}: {value:.6f}")
+    logger.info("\n=== Per-Class Per-SNR Metrics ===")
+    for class_name, snr_dict in per_class_per_snr_metrics.items():
+        logger.info(f"\n{class_name}:")
+        for snr_key, metrics_dict in snr_dict.items():
+            logger.info(f"  {snr_key}:")
+            for metric_name, value in metrics_dict.items():
+                logger.info(f"    {metric_name}: {value:.6f}")
     
     return all_metrics
 
@@ -786,11 +914,13 @@ def main():
     parser.add_argument('--device', type=str, default=None,
                        help='Device (cuda/cpu). Auto-detects if None.')
     parser.add_argument('--samples_per_class', type=int, default=1000,
-                       help='Number of samples to generate per class')
+                       help='Number of samples to generate per class per SNR')
     parser.add_argument('--batch_size', type=int, default=256,
                        help='Batch size for generation')
     parser.add_argument('--metrics', type=str, default='mmd,c2st,fid,psd,hist',
                        help='Comma-separated list of metrics: mmd,c2st,fid,psd,hist')
+    parser.add_argument('--snr_levels', type=str, default='-10,0,10,18',
+                       help='Comma-separated SNR levels in dB (default: -10,0,10,18 for low/medium/high)')
     parser.add_argument('--plots', action='store_true',
                        help='Create visualization plots')
     parser.add_argument('--output_dir', type=str, default=None,
@@ -806,10 +936,13 @@ def main():
     
     logger.info(f"Using device: {device}")
     
-    # Load checkpoint
-    model, checkpoint_args = load_checkpoint(args.checkpoint, device)
+    # Determine experiment setting first
+    # We need this to load the dataset and get SNR range
+    checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    checkpoint_args = checkpoint.get('args', None)
+    if checkpoint_args is None:
+        raise ValueError("Checkpoint does not contain 'args'")
     
-    # Determine experiment setting
     if args.experiment_setting is None:
         experiment_setting = checkpoint_args.experiment_setting
     else:
@@ -817,7 +950,7 @@ def main():
     
     logger.info(f"Using experiment setting: {experiment_setting}")
     
-    # Load test dataset
+    # Load test dataset to get actual SNR range
     logger.info(f"Loading test dataset from {args.data_path}")
     test_dataset = RML2016Dataset(
         data_path=args.data_path,
@@ -830,10 +963,27 @@ def main():
         precompute_negatives=False
     )
     
+    # Get actual SNR range from dataset
+    if hasattr(test_dataset, 'snr_labels'):
+        actual_snr_min = float(test_dataset.snr_labels.min())
+        actual_snr_max = float(test_dataset.snr_labels.max())
+        snr_range = (actual_snr_min, actual_snr_max)
+        logger.info(f"Detected SNR range from dataset: [{actual_snr_min}, {actual_snr_max}] dB")
+    else:
+        snr_range = (-20, 20)
+        logger.info(f"Using default SNR range: {snr_range}")
+    
+    # Load checkpoint with correct SNR range
+    model, checkpoint_args = load_checkpoint(args.checkpoint, device, snr_range=snr_range)
+    
     logger.info(f"Test dataset loaded: {len(test_dataset)} samples")
     
     # Parse metrics
     metrics_list = [m.strip() for m in args.metrics.split(',')]
+    
+    # Parse SNR levels
+    snr_levels = [float(s.strip()) for s in args.snr_levels.split(',')]
+    logger.info(f"Evaluating at SNR levels: {snr_levels}")
     
     # Run evaluation
     results = evaluate_generative_quality(
@@ -845,7 +995,8 @@ def main():
         device=device,
         metrics=metrics_list,
         create_plots=args.plots,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        snr_levels=snr_levels
     )
     
     logger.info("\nEvaluation completed!")

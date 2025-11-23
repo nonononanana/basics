@@ -11,6 +11,7 @@ DATA_PATH="data/RML2016.10a_dict.pkl"
 SAMPLES_PER_CLASS=1000
 BATCH_SIZE=256
 METRICS="mmd,c2st,fid,psd,hist"
+SNR_LEVELS="-10,0,10,18"  # Low, Medium, Medium, High SNR
 CREATE_PLOTS=true
 DEVICE=""  # Auto-detect if empty
 EXPERIMENT_SETTING=""  # Use checkpoint's setting if empty
@@ -39,6 +40,10 @@ while [[ $# -gt 0 ]]; do
             METRICS="$2"
             shift 2
             ;;
+        --snr_levels)
+            SNR_LEVELS="$2"
+            shift 2
+            ;;
         --no-plots)
             CREATE_PLOTS=false
             shift
@@ -61,9 +66,10 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --checkpoint PATH          Path to checkpoint file (default: meanflow/best_model.pth)"
             echo "  --data_path PATH           Path to RML2016.10a dataset (default: data/RML2016.10a_dict.pkl)"
-            echo "  --samples_per_class N      Number of samples per class (default: 1000)"
+            echo "  --samples_per_class N      Number of samples per class per SNR (default: 1000)"
             echo "  --batch_size N             Batch size for generation (default: 256)"
             echo "  --metrics LIST             Comma-separated metrics: mmd,c2st,fid,psd,hist (default: all)"
+            echo "  --snr_levels LIST          Comma-separated SNR levels in dB (default: -10,0,10,18)"
             echo "  --no-plots                 Skip creating visualization plots"
             echo "  --device DEVICE            Device: cuda or cpu (auto-detect if not specified)"
             echo "  --experiment_setting N     Experiment setting 1-12 (uses checkpoint's if not specified)"
@@ -76,6 +82,9 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "  # Full evaluation with custom checkpoint"
             echo "  $0 --checkpoint outputs/modulation/best_model.pth --samples_per_class 2000"
+            echo ""
+            echo "  # Evaluate at specific SNR levels"
+            echo "  $0 --snr_levels \"-10,0,10,18\""
             echo ""
             echo "  # CPU-only evaluation"
             echo "  $0 --device cpu"
@@ -110,6 +119,7 @@ CMD="$CMD --data_path $DATA_PATH"
 CMD="$CMD --samples_per_class $SAMPLES_PER_CLASS"
 CMD="$CMD --batch_size $BATCH_SIZE"
 CMD="$CMD --metrics $METRICS"
+CMD="$CMD --snr_levels $SNR_LEVELS"
 
 if [ "$CREATE_PLOTS" = true ]; then
     CMD="$CMD --plots"
@@ -133,9 +143,10 @@ echo "Generative Quality Evaluation"
 echo "=========================================="
 echo "Checkpoint: $CHECKPOINT"
 echo "Data path: $DATA_PATH"
-echo "Samples per class: $SAMPLES_PER_CLASS"
+echo "Samples per class per SNR: $SAMPLES_PER_CLASS"
 echo "Batch size: $BATCH_SIZE"
 echo "Metrics: $METRICS"
+echo "SNR levels: $SNR_LEVELS"
 echo "Create plots: $CREATE_PLOTS"
 if [ -n "$DEVICE" ]; then
     echo "Device: $DEVICE"
@@ -159,7 +170,12 @@ echo "=========================================="
 echo "Evaluation completed!"
 echo "=========================================="
 echo "Check outputs/generative_eval/ for results"
-echo "  - metrics.json: All computed metrics"
-echo "  - plots/: Visualization plots for each class"
+echo "  - metrics.json: All computed metrics (per-class, per-SNR, and SNR categories)"
+echo "  - plots/: Visualization plots for each class at key SNR levels"
+echo ""
+echo "SNR Category Summary:"
+echo "  - Low SNR: < -5 dB (challenging conditions)"
+echo "  - Medium SNR: -5 to 15 dB (typical conditions)"
+echo "  - High SNR: > 15 dB (ideal conditions)"
 
 

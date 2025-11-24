@@ -5,21 +5,21 @@
 
 echo "Testing Mean Flow training with ONLY reconstruction loss..."
 
-cd /userhome/MeanFlowOpenSetAMC
+cd /userhome/SNRMeanFlow
 
 # Run training with:
 # - ONLY reconstruction loss (lambda_rec=1.0)
 # - All other losses disabled (lambda_arc/pos/neg/rank/cls/anchor=0.0)
 # - Pure Mean Flow objective without energy-based or classification losses
 
-#python -m meanflow.train_modulation \
+python -m meanflow.train_modulation \
     --data_path data/RML2016.10a_dict.pkl \
     --experiment_setting 1 \
     --mode custom \
-    --epochs 500 \
+    --epochs 600 \
     --eval_freq 10 \
     --batch_size 1024 \
-    --lr 2e-4 \
+    --lr 5e-4 \
     --lambda_rec 1.0 \
     --lambda_arc 0.0 \
     --lambda_pos 0.0 \
@@ -32,7 +32,7 @@ cd /userhome/MeanFlowOpenSetAMC
     --rank_margin 0.5 \
     --rank_beta 10.0 \
     --target_fpr 0.05 \
-    --output_dir outputs/test_gen_500 \
+    --output_dir outputs/snr500 \
     --wandb_name test_gen \
     --device cuda \
     --seed 42
@@ -55,11 +55,11 @@ echo "=========================================="
 
 # Run generative evaluation on the trained model
 bash scripts/eval_generation.sh \
-    --checkpoint outputs/test_gen_500/best_model.pth \
+    --checkpoint outputs/snr500/checkpoint_epoch_499.pth \
     --data_path data/RML2016.10a_dict.pkl \
     --experiment_setting 1 \
     --samples_per_class 1000 \
-    --batch_size 512 \
+    --batch_size 1024 \
     --metrics mmd,c2st,fid,psd,hist \
     --device cuda
 

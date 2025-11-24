@@ -11,7 +11,6 @@ from torch.nn.functional import silu
 import math
 from typing import Optional, Tuple
 
-from .groupnorm import group_norm
 from .unet import (
     weight_init, Linear, Conv2d, GroupNorm, 
     PositionalEmbedding, FourierEmbedding, QKVAttention

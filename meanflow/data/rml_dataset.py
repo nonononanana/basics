@@ -582,6 +582,7 @@ def get_rml_dataloaders(
     val_split: float = 0.1,
     test_split: float = 0.1,
     normalize: bool = False,
+    return_snr: bool = True,
     seed: int = 42,
     precompute_negatives: bool = True
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
@@ -598,6 +599,7 @@ def get_rml_dataloaders(
         val_split: Proportion of data for validation (default: 0.1)
         test_split: Proportion of data for testing (default: 0.1)
         normalize: Whether to normalize I/Q samples
+        return_snr: Whether to return SNR information (default: True)
         seed: Random seed
         precompute_negatives: Whether to pre-compute negative samples (faster training, more memory)
     
@@ -620,7 +622,7 @@ def get_rml_dataloaders(
         val_split=val_split,
         test_split=test_split,
         normalize=normalize,
-        return_snr=True,
+        return_snr=return_snr,
         seed=seed,
         precompute_negatives=precompute_negatives
     )
@@ -634,7 +636,7 @@ def get_rml_dataloaders(
         val_split=val_split,
         test_split=test_split,
         normalize=normalize,
-        return_snr=True,
+        return_snr=return_snr,
         seed=seed,
         precompute_negatives=precompute_negatives  # Now includes negative samples for validation
     )
@@ -648,7 +650,7 @@ def get_rml_dataloaders(
         val_split=val_split,
         test_split=test_split,
         normalize=normalize,
-        return_snr=True,
+        return_snr=return_snr,
         seed=seed,
         precompute_negatives=False  # No negative samples needed for testing
     )

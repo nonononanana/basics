@@ -39,8 +39,7 @@ class DenoisingUNet(nn.Module):
         use_attention: bool = True,  # Whether to use attention
         attention_levels: Tuple[int, ...] = (2, 3),  # Which levels to apply attention
         embedding_type: str = 'positional',  # Time embedding type
-        class_embed_dim: Optional[int] = None,  # Class embedding dimension
-        use_noisy_conditioning: bool = True  # Whether to use noisy signal as condition
+        class_embed_dim: Optional[int] = None  # Class embedding dimension
     ):
         """
         Initialize DenoisingUNet
@@ -59,7 +58,6 @@ class DenoisingUNet(nn.Module):
             attention_levels: Which levels to use attention
             embedding_type: Type of time embedding
             class_embed_dim: Dimension of class embedding
-            use_noisy_conditioning: Whether to concatenate noisy signal as condition
         """
         super().__init__()
         
@@ -72,7 +70,6 @@ class DenoisingUNet(nn.Module):
         self.num_blocks = num_blocks
         self.dropout = dropout
         self.class_dropout = class_dropout
-        self.use_noisy_conditioning = use_noisy_conditioning
         
         # Time embedding dimension
         time_embed_dim = model_channels * 4
@@ -104,25 +101,9 @@ class DenoisingUNet(nn.Module):
         # Dedicated null-class embedding for classifier-free guidance
         self.null_class_time = nn.Parameter(torch.zeros(time_embed_dim))
         
-        # Noisy signal encoder (to create conditioning features)
-        if use_noisy_conditioning:
-            # Process noisy signal to create conditioning embedding
-            self.noisy_encoder = nn.Sequential(
-                Conv1d(in_channels, model_channels, kernel_size=3, padding=1),
-                nn.SiLU(),
-                Conv1d(model_channels, model_channels, kernel_size=3, padding=1),
-                nn.SiLU(),
-            )
-            # Global pooling + projection to time embedding dimension
-            self.noisy_proj = nn.Sequential(
-                Linear(model_channels, time_embed_dim),
-                nn.SiLU(),
-                Linear(time_embed_dim, time_embed_dim)
-            )
-            # Initial conv takes both z and noisy features concatenated
-            init_in_channels = in_channels + model_channels
-        else:
-            init_in_channels = in_channels
+        # For denoising, we don't need separate noisy conditioning
+        # The noisy signal is the starting point (t=1) of the flow
+        init_in_channels = in_channels
         
         # Initial convolution
         self.init_conv = Conv1d(
@@ -275,26 +256,9 @@ class DenoisingUNet(nn.Module):
                     class_emb[drop_mask] = null_row.expand(class_emb[drop_mask].shape[0], -1)
             time_emb = time_emb + class_emb
         
-        # Process noisy conditioning if provided
-        if self.use_noisy_conditioning and noisy_cond is not None:
-            # Ensure noisy_cond shape
-            if noisy_cond.dim() == 3 and noisy_cond.shape[1] == 2 and noisy_cond.shape[2] == 128:
-                pass
-            else:
-                noisy_cond = noisy_cond.view(x.shape[0], 2, 128)
-            
-            # Encode noisy signal
-            noisy_feat = self.noisy_encoder(noisy_cond)  # [batch, model_channels, 128]
-            
-            # Add global noisy embedding to time embedding
-            noisy_global = noisy_feat.mean(dim=2)  # [batch, model_channels]
-            noisy_emb = self.noisy_proj(noisy_global)
-            time_emb = time_emb + noisy_emb
-            
-            # Concatenate noisy features with input for spatial conditioning
-            x_input = torch.cat([x, noisy_feat], dim=1)  # [batch, 2+model_channels, 128]
-        else:
-            x_input = x
+        # For denoising, x itself is the noisy signal at t=1 or interpolated state
+        # No need for separate noisy conditioning
+        x_input = x
         
         # Apply SiLU activation to combined embedding
         emb = silu(time_emb)

@@ -174,8 +174,7 @@ def create_model(args) -> MeanFlowDenoising:
         'class_dropout': args.class_dropout,
         'use_attention': True,
         'attention_levels': (2, 3),
-        'embedding_type': 'positional',
-        'use_noisy_conditioning': True  # Enable noisy signal conditioning
+        'embedding_type': 'positional'
     }
     
     # Create Mean Flow model for denoising

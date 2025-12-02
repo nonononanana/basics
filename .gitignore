@@ -60,4 +60,4 @@ output_dir/
 *.err
 wandb/
 wandb.tar
-
+gendata/

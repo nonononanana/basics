@@ -662,7 +662,7 @@ def main():
         
         # Update progress bar
         epoch_progress.set_postfix({
-            'Loss': f'{train_metrics["train/total_loss"]:.4f}',
+            'Loss': f'{train_metrics["train/loss"]:.4f}',
             'LR': f'{train_metrics["train/learning_rate"]:.2e}'
         })
         

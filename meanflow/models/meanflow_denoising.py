@@ -171,38 +171,20 @@ class MeanFlowDenoising(nn.Module):
             # Target velocity field
             u_tgt = (v - (t - r) * dudt).detach()
             
-            # Mean flow reconstruction loss
-            flow_loss = (u_pred - u_tgt)**2
-            flow_loss = flow_loss.mean(dim=(1, 2))  # Mean over channel and time dimensions
+            # Mean flow loss: learn velocity field at all time steps
+            # This single loss is sufficient for the model to learn the entire
+            # denoising trajectory from noisy (t=1) to clean (t=0)
+            loss = (u_pred - u_tgt)**2
+            loss = loss.mean(dim=(1, 2))  # Mean over channel and time dimensions
             
             # Adaptive weighting for stability
-            adp_wt = (flow_loss.detach() + self.args.norm_eps) ** self.args.norm_p
-            flow_loss = flow_loss / adp_wt
-            flow_loss = flow_loss.mean()  # Mean over batch
-        
-        # Direct denoising loss: predict clean from noisy at t=0.5
-        # This helps the model learn the denoising mapping
-        t_mid = torch.full((batch_size,), 0.5, device=device)
-        t_mid_expanded = t_mid.view(-1, 1, 1)
-        z_mid = (1 - t_mid_expanded) * x_clean + t_mid_expanded * x_noisy
-        
-        u_mid = self.net(
-            z_mid,
-            (t_mid, t_mid),  # t=r for single-step inference
-            aug_cond,
-            class_labels=class_labels,
-            noisy_cond=None
-        )
-        x_pred = z_mid - t_mid_expanded * u_mid
-        denoising_loss = F.mse_loss(x_pred, x_clean)
-        
-        # Total loss
-        total_loss = flow_loss + 0.5 * denoising_loss
+            adp_wt = (loss.detach() + self.args.norm_eps) ** self.args.norm_p
+            loss = loss / adp_wt
+            loss = loss.mean()  # Mean over batch
         
         return {
-            'total_loss': total_loss,
-            'flow_loss': flow_loss,
-            'denoising_loss': denoising_loss
+            'total_loss': loss,
+            'loss': loss
         }
     
     def denoise(

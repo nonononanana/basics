@@ -274,8 +274,6 @@ def train_epoch(
     
     # Initialize metrics
     total_loss = 0.0
-    flow_loss_total = 0.0
-    denoising_loss_total = 0.0
     num_batches = 0
     
     # Training loop with progress bar
@@ -343,8 +341,6 @@ def train_epoch(
         
         # Update metrics
         total_loss += loss.item()
-        flow_loss_total += loss_dict['flow_loss'].item()
-        denoising_loss_total += loss_dict['denoising_loss'].item()
         num_batches += 1
         
         # Learning rate scheduler step
@@ -356,16 +352,12 @@ def train_epoch(
         current_lr = optimizer.param_groups[0]['lr']
         progress_bar.set_postfix({
             'Loss': f'{current_loss:.4f}',
-            'Flow': f'{(flow_loss_total / num_batches):.4f}',
-            'Denoise': f'{(denoising_loss_total / num_batches):.4f}',
             'lr': f'{current_lr:.2e}'
         })
     
     # Compute average metrics
     metrics = {
-        'train/total_loss': total_loss / num_batches,
-        'train/flow_loss': flow_loss_total / num_batches,
-        'train/denoising_loss': denoising_loss_total / num_batches,
+        'train/loss': total_loss / num_batches,
         'train/learning_rate': optimizer.param_groups[0]['lr']
     }
     

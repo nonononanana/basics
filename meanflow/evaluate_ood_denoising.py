@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4,
                        help='Number of data loading workers')
     parser.add_argument('--method', type=str, default='min_error', 
-                       choices=['min_error', 'avg_error', 'improvement', 'snr_improvement'],
+                       choices=['min_error', 'avg_error', 'improvement', 'snr_improvement', 'correlation'],
                        help='OOD scoring method')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                        help='Device to use')
@@ -349,6 +349,69 @@ def compute_ood_score_snr_improvement(
     return -max_improvement
 
 
+def compute_ood_score_correlation(
+    model: MeanFlowDenoising,
+    noisy_signal: torch.Tensor,
+    clean_signal: torch.Tensor,
+    num_classes: int
+) -> torch.Tensor:
+    """
+    OOD score based on Input-Output Correlation.
+    ID samples should have higher correlation with their denoised versions.
+    OOD samples (if hallucinated) will have low correlation with input.
+    
+    Score = -Max_Correlation (Lower correlation -> Higher OOD score)
+    
+    Args:
+        model: Trained denoising model
+        noisy_signal: Noisy signal [batch, 2, 128]
+        clean_signal: Clean signal (Unused for blind score)
+        num_classes: Number of known classes
+    
+    Returns:
+        ood_scores: OOD scores [batch]
+    """
+    batch_size = noisy_signal.shape[0]
+    device = noisy_signal.device
+    
+    # Normalize noisy signal for correlation calculation
+    # [batch, 2, 128] -> [batch, 256]
+    noisy_flat = noisy_signal.view(batch_size, -1)
+    # Subtract mean
+    noisy_flat = noisy_flat - noisy_flat.mean(dim=1, keepdim=True)
+    # Normalize
+    noisy_norm = torch.norm(noisy_flat, dim=1, keepdim=True) + 1e-8
+    noisy_flat = noisy_flat / noisy_norm
+    
+    max_corr = torch.full((batch_size,), -1.0, device=device)
+    
+    for class_id in range(num_classes):
+        class_labels = torch.full((batch_size,), class_id, dtype=torch.long, device=device)
+        
+        with torch.no_grad():
+            denoised = model.denoise(
+                x_noisy=noisy_signal,
+                class_labels=class_labels,
+                num_steps=1
+            )
+        
+        # Calculate correlation
+        denoised_flat = denoised.view(batch_size, -1)
+        denoised_flat = denoised_flat - denoised_flat.mean(dim=1, keepdim=True)
+        denoised_norm = torch.norm(denoised_flat, dim=1, keepdim=True) + 1e-8
+        denoised_flat = denoised_flat / denoised_norm
+        
+        # Dot product of normalized vectors = Cosine Similarity = Correlation
+        # (since means are 0)
+        corr = (noisy_flat * denoised_flat).sum(dim=1)
+        
+        max_corr = torch.maximum(max_corr, corr)
+    
+    # High correlation = ID (low score)
+    # Low correlation = OOD (high score)
+    return -max_corr
+
+
 def evaluate_ood_detection(
     model: MeanFlowDenoising,
     test_loader: DataLoader,
@@ -397,6 +460,10 @@ def evaluate_ood_detection(
                 )
             elif method == 'snr_improvement':
                 ood_scores = compute_ood_score_snr_improvement(
+                    model, noisy_samples, clean_samples, model.num_classes
+                )
+            elif method == 'correlation':
+                ood_scores = compute_ood_score_correlation(
                     model, noisy_samples, clean_samples, model.num_classes
                 )
             else:

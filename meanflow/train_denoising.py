@@ -25,9 +25,6 @@ from tqdm import tqdm
 # Import wandb for experiment tracking
 import wandb
 
-# Import sklearn metrics for OOD evaluation
-from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve, auc
-
 # Import custom modules
 from meanflow.data.rml_dataset import get_rml_denoising_dataloaders, RML2016DenoisingDataset, EXPERIMENT_SETTINGS
 from meanflow.models.meanflow_denoising import MeanFlowDenoising
@@ -228,9 +225,10 @@ def compute_denoising_metrics(
     
     # Correlation coefficient between predicted and true clean signals
     # Flatten and compute correlation
-    pred_flat = x_clean_pred.view(-1).cpu().numpy()
-    true_flat = x_clean_true.view(-1).cpu().numpy()
-    
+    # Per-sample correlation
+    batch_size = x_clean_pred.shape[0]
+    pred_flat = x_clean_pred.reshape(batch_size, -1).detach().cpu().numpy()
+    true_flat = x_clean_true.reshape(batch_size, -1).detach().cpu().numpy()
     correlation = np.corrcoef(pred_flat, true_flat)[0, 1]
     
     # PSNR: Peak Signal-to-Noise Ratio
@@ -374,7 +372,7 @@ def evaluate(
     args
 ) -> Dict[str, float]:
     """
-    Evaluate model on test set with denoising metrics and OOD detection
+    Evaluate model on test set with denoising metrics
     
     Args:
         model: Mean Flow denoising model
@@ -387,20 +385,12 @@ def evaluate(
     """
     model.eval()
     
-    # Storage for denoising metrics
+    # Storage for metrics
     all_mse = []
     all_nmse = []
     all_snr_improvement = []
     all_correlation = []
     all_psnr = []
-    
-    # Storage for OOD detection
-    all_min_errors = []  # Minimum MSE across all classes (OOD score)
-    all_best_class_ids = []  # Predicted class IDs
-    all_labels = []  # True labels (or -1 for unknown)
-    all_is_unknown = []  # Boolean mask for unknown samples
-    all_snr_values = []
-    all_modulations = []
     
     # Per-SNR metrics
     snr_metrics = {}
@@ -421,43 +411,18 @@ def evaluate(
             # Move to device
             noisy_samples = noisy_samples.to(args.device)
             clean_samples = clean_samples.to(args.device)
-            labels_cpu = labels  # Keep original labels for metrics
+            labels = labels.to(args.device)
             
-            batch_size = noisy_samples.shape[0]
+            # Denoise signals
+            clean_pred = model.denoise(
+                x_noisy=noisy_samples,
+                class_labels=labels,
+                num_steps=1
+            )
             
-            # For each sample, try denoising with all known classes and pick the best
-            # This is similar to how modulation classification works
-            best_predictions = torch.zeros(batch_size, 2, 128, device=args.device)
-            best_class_ids = torch.zeros(batch_size, dtype=torch.long, device=args.device)
-            min_errors = torch.full((batch_size,), float('inf'), device=args.device)
-            
-            # Try each known class label
-            for class_id in range(model.num_classes):
-                # Create batch with all samples using current class label
-                class_labels = torch.full((batch_size,), class_id, dtype=torch.long, device=args.device)
-                
-                # Denoise with this class label
-                clean_pred = model.denoise(
-                    x_noisy=noisy_samples,
-                    class_labels=class_labels,
-                    num_steps=1
-                )
-                
-                # Compute reconstruction error for each sample
-                # Use MSE as the metric to determine best class
-                errors = F.mse_loss(clean_pred, clean_samples, reduction='none')
-                errors = errors.mean(dim=(1, 2))  # [batch]
-                
-                # Update best predictions for samples where this class gives lower error
-                better_mask = errors < min_errors
-                best_predictions[better_mask] = clean_pred[better_mask]
-                best_class_ids[better_mask] = class_id
-                min_errors[better_mask] = errors[better_mask]
-            
-            # Now best_predictions contains the best denoising result for each sample
-            # Compute batch metrics using best predictions
+            # Compute batch metrics
             batch_metrics = compute_denoising_metrics(
-                x_clean_pred=best_predictions,
+                x_clean_pred=clean_pred,
                 x_clean_true=clean_samples,
                 x_noisy=noisy_samples
             )
@@ -467,14 +432,6 @@ def evaluate(
             all_snr_improvement.append(batch_metrics['snr_improvement'])
             all_correlation.append(batch_metrics['correlation'])
             all_psnr.append(batch_metrics['psnr'])
-            
-            # Store OOD detection data
-            all_min_errors.append(min_errors.cpu())
-            all_best_class_ids.append(best_class_ids.cpu())
-            all_labels.append(labels_cpu)
-            all_is_unknown.append(info['is_unknown'])
-            all_snr_values.append(info['snr'])
-            all_modulations.extend(info['original_modulation'])
             
             # Per-sample metrics for SNR and modulation breakdown
             snr_values = info['snr'].numpy()
@@ -486,7 +443,7 @@ def evaluate(
                 mod = modulations[i]
                 
                 # Per-sample metrics
-                sample_pred = best_predictions[i:i+1]
+                sample_pred = clean_pred[i:i+1]
                 sample_true = clean_samples[i:i+1]
                 sample_noisy = noisy_samples[i:i+1]
                 
@@ -506,66 +463,13 @@ def evaluate(
                 modulation_metrics[mod]['snr_imp'].append(sample_metrics['snr_improvement'])
                 modulation_metrics[mod]['corr'].append(sample_metrics['correlation'])
     
-    # Concatenate OOD detection data
-    all_min_errors = torch.cat(all_min_errors).numpy()
-    all_best_class_ids = torch.cat(all_best_class_ids).numpy()
-    all_labels = torch.cat(all_labels).numpy()
-    all_is_unknown = torch.cat(all_is_unknown).numpy()
-    all_snr_values = torch.cat(all_snr_values).numpy()
-    all_modulations = np.array(all_modulations)
-    
-    # Separate known and unknown samples
-    known_mask = ~all_is_unknown
-    unknown_mask = all_is_unknown
-    
-    # Compute classification accuracy on known samples (ignoring OOD)
-    known_predictions = all_best_class_ids[known_mask]
-    known_labels = all_labels[known_mask]
-    closed_set_accuracy = (known_predictions == known_labels).mean() if known_mask.sum() > 0 else 0.0
-    
-    # Compute OOD detection metrics
-    # Use min_errors as OOD scores: higher error = more likely OOD
-    ood_labels = all_is_unknown.astype(int)  # 0=known, 1=unknown
-    ood_scores = all_min_errors  # Higher MSE = more likely OOD
-    
-    # Check if we have both known and unknown samples
-    has_unknown = unknown_mask.sum() > 0
-    has_known = known_mask.sum() > 0
-    
-    if has_unknown and has_known:
-        # Compute AUROC and AUPR
-        auroc = roc_auc_score(ood_labels, ood_scores)
-        precision, recall, _ = precision_recall_curve(ood_labels, ood_scores)
-        aupr = auc(recall, precision)
-        
-        # Compute FPR@95 (False Positive Rate at 95% True Positive Rate)
-        fpr, tpr, thresholds = roc_curve(ood_labels, ood_scores)
-        idx_95 = np.argmax(tpr >= 0.95)
-        fpr_at_95 = fpr[idx_95] if idx_95 < len(fpr) else 1.0
-    else:
-        auroc = np.nan
-        aupr = np.nan
-        fpr_at_95 = np.nan
-        logger.info('No unknown samples in dataset - AUROC/AUPR not computed')
-    
     # Compile overall metrics
     metrics = {
-        # Denoising metrics
         'eval/mse': np.mean(all_mse),
         'eval/nmse': np.mean(all_nmse),
         'eval/snr_improvement': np.mean(all_snr_improvement),
         'eval/correlation': np.mean(all_correlation),
-        'eval/psnr': np.mean(all_psnr),
-        
-        # Classification metrics
-        'eval/closed_set_accuracy': closed_set_accuracy,
-        
-        # OOD detection metrics
-        'eval/auroc': auroc,
-        'eval/aupr': aupr,
-        'eval/fpr@95': fpr_at_95,
-        'eval/mean_ood_score_known': ood_scores[known_mask].mean() if has_known else 0,
-        'eval/mean_ood_score_unknown': ood_scores[unknown_mask].mean() if has_unknown else 0,
+        'eval/psnr': np.mean(all_psnr)
     }
     
     # Add per-SNR metrics
@@ -574,101 +478,26 @@ def evaluate(
         metrics[f'eval/snr_{snr}/snr_improvement'] = np.mean(snr_data['snr_imp'])
         metrics[f'eval/snr_{snr}/correlation'] = np.mean(snr_data['corr'])
     
-    # Per-SNR OOD metrics
-    if has_unknown and has_known:
-        unique_snrs = np.unique(all_snr_values)
-        for snr in sorted(unique_snrs):
-            snr_mask = all_snr_values == snr
-            snr_known_mask = snr_mask & known_mask
-            snr_unknown_mask = snr_mask & unknown_mask
-            
-            if snr_known_mask.sum() > 0 and snr_unknown_mask.sum() > 0:
-                snr_ood_labels = all_is_unknown[snr_mask].astype(int)
-                snr_ood_scores = ood_scores[snr_mask]
-                try:
-                    snr_auroc = roc_auc_score(snr_ood_labels, snr_ood_scores)
-                    metrics[f'eval/snr_{int(snr)}/auroc'] = snr_auroc
-                except:
-                    pass
-    
     # Add per-modulation metrics
-    known_classes = EXPERIMENT_SETTINGS[args.experiment_setting]['known']
-    unknown_classes = EXPERIMENT_SETTINGS[args.experiment_setting]['unknown']
-    
     for mod, mod_data in modulation_metrics.items():
         metrics[f'eval/mod_{mod}/mse'] = np.mean(mod_data['mse'])
         metrics[f'eval/mod_{mod}/snr_improvement'] = np.mean(mod_data['snr_imp'])
         metrics[f'eval/mod_{mod}/correlation'] = np.mean(mod_data['corr'])
     
-    # Per-unknown-class OOD detection metrics
-    if has_unknown and has_known:
-        for unknown_cls in unknown_classes:
-            unknown_cls_mask = all_modulations == unknown_cls
-            if unknown_cls_mask.sum() > 0:
-                # Get OOD scores for this unknown class
-                unknown_cls_scores = ood_scores[unknown_cls_mask]
-                
-                # Combine with known scores for AUROC
-                combined_scores = np.concatenate([ood_scores[known_mask], unknown_cls_scores])
-                combined_labels = np.concatenate([
-                    np.zeros(known_mask.sum()),  # Known = 0
-                    np.ones(len(unknown_cls_scores))  # Unknown = 1
-                ])
-                
-                # Calculate metrics for this unknown class
-                try:
-                    auroc_cls = roc_auc_score(combined_labels, combined_scores)
-                    precision_cls, recall_cls, _ = precision_recall_curve(combined_labels, combined_scores)
-                    aupr_cls = auc(recall_cls, precision_cls)
-                    
-                    metrics[f'eval/ood_{unknown_cls}_auroc'] = auroc_cls
-                    metrics[f'eval/ood_{unknown_cls}_aupr'] = aupr_cls
-                    metrics[f'eval/ood_{unknown_cls}_mean_score'] = unknown_cls_scores.mean()
-                except:
-                    pass
-    
     # Log summary
-    logger.info(f'\n{"="*60}')
-    logger.info(f'Denoising & OOD Detection Evaluation Results')
-    logger.info(f'{"="*60}')
-    logger.info(f'\nDenoising Metrics:')
+    logger.info(f'\nDenoising Evaluation Results:')
     logger.info(f'  Overall MSE: {metrics["eval/mse"]:.6f}')
     logger.info(f'  Overall NMSE: {metrics["eval/nmse"]:.6f}')
     logger.info(f'  SNR Improvement: {metrics["eval/snr_improvement"]:.2f} dB')
     logger.info(f'  Correlation: {metrics["eval/correlation"]:.4f}')
     logger.info(f'  PSNR: {metrics["eval/psnr"]:.2f} dB')
     
-    logger.info(f'\nClassification Metrics:')
-    logger.info(f'  Closed-set Accuracy: {closed_set_accuracy:.4f}')
-    
-    if has_unknown and has_known:
-        logger.info(f'\nOOD Detection Metrics:')
-        logger.info(f'  AUROC: {auroc:.4f}')
-        logger.info(f'  AUPR: {aupr:.4f}')
-        logger.info(f'  FPR@95: {fpr_at_95:.4f}')
-        logger.info(f'  Mean OOD Score (Known): {metrics["eval/mean_ood_score_known"]:.6f}')
-        logger.info(f'  Mean OOD Score (Unknown): {metrics["eval/mean_ood_score_unknown"]:.6f}')
-        
-        # Log per-unknown-class OOD metrics
-        logger.info(f'\nPer-Unknown-Class OOD Detection:')
-        for unknown_cls in unknown_classes:
-            if f'eval/ood_{unknown_cls}_auroc' in metrics:
-                logger.info(f'  {unknown_cls}:')
-                logger.info(f'    AUROC: {metrics[f"eval/ood_{unknown_cls}_auroc"]:.4f}')
-                logger.info(f'    AUPR: {metrics[f"eval/ood_{unknown_cls}_aupr"]:.4f}')
-                logger.info(f'    Mean Score: {metrics[f"eval/ood_{unknown_cls}_mean_score"]:.6f}')
-    
     # Log per-SNR summary
-    logger.info(f'\nPer-SNR Results:')
+    logger.info('\nPer-SNR Results:')
     for snr in sorted(snr_metrics.keys()):
-        snr_str = f'  SNR {snr:3d} dB: MSE={np.mean(snr_metrics[snr]["mse"]):.6f}, '
-        snr_str += f'Imp={np.mean(snr_metrics[snr]["snr_imp"]):.2f} dB, '
-        snr_str += f'Corr={np.mean(snr_metrics[snr]["corr"]):.4f}'
-        if f'eval/snr_{int(snr)}/auroc' in metrics:
-            snr_str += f', AUROC={metrics[f"eval/snr_{int(snr)}/auroc"]:.4f}'
-        logger.info(snr_str)
-    
-    logger.info(f'{"="*60}\n')
+        logger.info(f'  SNR {snr:3d} dB: MSE={np.mean(snr_metrics[snr]["mse"]):.6f}, '
+                   f'Imp={np.mean(snr_metrics[snr]["snr_imp"]):.2f} dB, '
+                   f'Corr={np.mean(snr_metrics[snr]["corr"]):.4f}')
     
     return metrics
 

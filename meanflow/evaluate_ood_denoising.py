@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4,
                        help='Number of data loading workers')
     parser.add_argument('--method', type=str, default='min_error', 
-                       choices=['min_error', 'avg_error', 'improvement'],
+                       choices=['min_error', 'avg_error', 'improvement', 'snr_improvement'],
                        help='OOD scoring method')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                        help='Device to use')
@@ -99,6 +99,61 @@ def load_model(checkpoint_path: str, device: str) -> MeanFlowDenoising:
     model.eval()
     
     return model
+
+
+def estimate_snr(signal: torch.Tensor) -> torch.Tensor:
+    """
+    Estimate SNR of a signal batch using M2M4 estimator.
+    Assumes complex signal structure (I/Q channels).
+    
+    Args:
+        signal: [batch, 2, length]
+        
+    Returns:
+        Estimated SNR in dB [batch]
+    """
+    # Separate I and Q
+    i = signal[:, 0, :]
+    q = signal[:, 1, :]
+    
+    # Compute moments
+    # M2 = E[|y|^2]
+    y_sq = i**2 + q**2
+    m2 = torch.mean(y_sq, dim=1)
+    
+    # M4 = E[|y|^4]
+    y_quad = y_sq**2
+    m4 = torch.mean(y_quad, dim=1)
+    
+    # M2M4 Estimate for M-PSK (approximate for others)
+    # S = sqrt(2*M2^2 - M4)
+    # N = M2 - S
+    
+    # Calculate signal power
+    s_term = 2 * m2**2 - m4
+    
+    # Handle numerical issues (if 2*M2^2 < M4, estimator fails)
+    # This happens for signals with high kurtosis or very low SNR
+    # We mask these and assign a low SNR
+    valid_mask = s_term > 0
+    
+    s_est = torch.zeros_like(m2)
+    s_est[valid_mask] = torch.sqrt(s_term[valid_mask])
+    
+    n_est = m2 - s_est
+    
+    # Compute SNR
+    # Clip noise to avoid division by zero
+    n_est = torch.clamp(n_est, min=1e-9)
+    s_est = torch.clamp(s_est, min=1e-9)
+    
+    snr_linear = s_est / n_est
+    snr_db = 10 * torch.log10(snr_linear)
+    
+    # Set invalid estimates to a low value
+    snr_db[~valid_mask] = -20.0
+    
+    return snr_db
 
 
 def compute_ood_score_min_error(
@@ -246,6 +301,54 @@ def compute_ood_score_improvement(
     return ood_scores
 
 
+def compute_ood_score_snr_improvement(
+    model: MeanFlowDenoising,
+    noisy_signal: torch.Tensor,
+    clean_signal: torch.Tensor,
+    num_classes: int
+) -> torch.Tensor:
+    """
+    OOD score based on estimated SNR improvement.
+    Uses a blind SNR estimator to calculate SNR before and after denoising.
+    Score = -(SNR_after - SNR_before)
+    
+    Args:
+        model: Trained denoising model
+        noisy_signal: Noisy signal [batch, 2, 128]
+        clean_signal: Clean signal [batch, 2, 128] (Unused)
+        num_classes: Number of known classes
+    
+    Returns:
+        ood_scores: OOD scores [batch]
+    """
+    batch_size = noisy_signal.shape[0]
+    device = noisy_signal.device
+    
+    # Estimate input SNR
+    snr_in = estimate_snr(noisy_signal)
+    
+    max_improvement = torch.full((batch_size,), float('-inf'), device=device)
+    
+    for class_id in range(num_classes):
+        class_labels = torch.full((batch_size,), class_id, dtype=torch.long, device=device)
+        
+        with torch.no_grad():
+            denoised = model.denoise(
+                x_noisy=noisy_signal,
+                class_labels=class_labels,
+                num_steps=1
+            )
+            
+        snr_out = estimate_snr(denoised)
+        improvement = snr_out - snr_in
+        
+        max_improvement = torch.maximum(max_improvement, improvement)
+    
+    # High improvement = ID (low score)
+    # Low improvement = OOD (high score)
+    return -max_improvement
+
+
 def evaluate_ood_detection(
     model: MeanFlowDenoising,
     test_loader: DataLoader,
@@ -290,6 +393,10 @@ def evaluate_ood_detection(
                 )
             elif method == 'improvement':
                 ood_scores = compute_ood_score_improvement(
+                    model, noisy_samples, clean_samples, model.num_classes
+                )
+            elif method == 'snr_improvement':
+                ood_scores = compute_ood_score_snr_improvement(
                     model, noisy_samples, clean_samples, model.num_classes
                 )
             else:
@@ -413,4 +520,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

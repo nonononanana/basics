@@ -257,3 +257,4 @@ A: 取决于数据和模型质量。通常AUROC > 0.85表示效果不错。可�
 **Q: 能否结合energy-based方法？**
 A: 可以！将MSE score和energy score融合可能获得更好的OOD检测性能。
 
+

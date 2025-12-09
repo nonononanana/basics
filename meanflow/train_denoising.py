@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
+from sklearn.metrics import roc_auc_score
 
 # Import wandb for experiment tracking
 import wandb
@@ -186,6 +187,61 @@ def create_model(args) -> MeanFlowDenoising:
     )
     
     return model
+
+
+def estimate_snr(signal: torch.Tensor) -> torch.Tensor:
+    """
+    Estimate SNR of a signal batch using M2M4 estimator.
+    Assumes complex signal structure (I/Q channels).
+    
+    Args:
+        signal: [batch, 2, length]
+        
+    Returns:
+        Estimated SNR in dB [batch]
+    """
+    # Separate I and Q
+    i = signal[:, 0, :]
+    q = signal[:, 1, :]
+    
+    # Compute moments
+    # M2 = E[|y|^2]
+    y_sq = i**2 + q**2
+    m2 = torch.mean(y_sq, dim=1)
+    
+    # M4 = E[|y|^4]
+    y_quad = y_sq**2
+    m4 = torch.mean(y_quad, dim=1)
+    
+    # M2M4 Estimate for M-PSK (approximate for others)
+    # S = sqrt(2*M2^2 - M4)
+    # N = M2 - S
+    
+    # Calculate signal power
+    s_term = 2 * m2**2 - m4
+    
+    # Handle numerical issues (if 2*M2^2 < M4, estimator fails)
+    # This happens for signals with high kurtosis or very low SNR
+    # We mask these and assign a low SNR
+    valid_mask = s_term > 0
+    
+    s_est = torch.zeros_like(m2)
+    s_est[valid_mask] = torch.sqrt(s_term[valid_mask])
+    
+    n_est = m2 - s_est
+    
+    # Compute SNR
+    # Clip noise to avoid division by zero
+    n_est = torch.clamp(n_est, min=1e-9)
+    s_est = torch.clamp(s_est, min=1e-9)
+    
+    snr_linear = s_est / n_est
+    snr_db = 10 * torch.log10(snr_linear)
+    
+    # Set invalid estimates to a low value
+    snr_db[~valid_mask] = -20.0
+    
+    return snr_db
 
 
 def compute_denoising_metrics(
@@ -406,6 +462,14 @@ def evaluate(
         ncols=80
     )
     
+    # Store data for OOD evaluation
+    ood_labels = [] # 0=known, 1=unknown
+    
+    # Store OOD scores for different metrics
+    ood_min_errors = [] # MSE
+    ood_max_corrs = [] # Correlation
+    ood_max_snr_imps = [] # Blind SNR Improvement
+
     with torch.no_grad():
         for noisy_samples, clean_samples, labels, info in eval_progress:
             # Move to device
@@ -413,7 +477,8 @@ def evaluate(
             clean_samples = clean_samples.to(args.device)
             labels = labels.to(args.device)
             
-            # Denoise signals
+            # --- Standard Denoising Evaluation (using provided labels) ---
+            # For OOD/Unknown labels (-1), this uses the null embedding (via previous fix)
             clean_pred = model.denoise(
                 x_noisy=noisy_samples,
                 class_labels=labels,
@@ -432,6 +497,72 @@ def evaluate(
             all_snr_improvement.append(batch_metrics['snr_improvement'])
             all_correlation.append(batch_metrics['correlation'])
             all_psnr.append(batch_metrics['psnr'])
+
+            # --- OOD Evaluation: Polling Strategy ---
+            # Assume we don't know the label (even for known classes), and try all known classes.
+            # This gives us the "Best Fit" metrics.
+            
+            batch_size = noisy_samples.shape[0]
+            
+            # Initialize "Best Fit" metrics
+            batch_min_errors = torch.full((batch_size,), float('inf'), device=args.device)
+            batch_max_corrs = torch.full((batch_size,), -1.0, device=args.device)
+            batch_max_snr_imps = torch.full((batch_size,), float('-inf'), device=args.device)
+            
+            # Estimate input SNR for blind metric
+            snr_in = estimate_snr(noisy_samples)
+
+            # Pre-calculate normalized input for correlation
+            noisy_flat = noisy_samples.view(batch_size, -1)
+            noisy_flat = noisy_flat - noisy_flat.mean(dim=1, keepdim=True)
+            noisy_norm = torch.norm(noisy_flat, dim=1, keepdim=True) + 1e-8
+            noisy_flat = noisy_flat / noisy_norm
+            
+            # Iterate over all known classes
+            for class_id in range(model.num_classes):
+                 # Construct labels for this specific class hypothesis
+                hypothesis_labels = torch.full((batch_size,), class_id, dtype=torch.long, device=args.device)
+                
+                # Denoise with this hypothesis
+                denoised_hypothesis = model.denoise(
+                    x_noisy=noisy_samples,
+                    class_labels=hypothesis_labels,
+                    num_steps=1
+                )
+                
+                # Metric 1: Reconstruction Error (MSE vs Clean) - NOT BLIND (Reference)
+                # Note: This uses Ground Truth Clean Signal, so it's an "Oracle" metric
+                errors = F.mse_loss(denoised_hypothesis, clean_samples, reduction='none')
+                errors = errors.mean(dim=(1, 2)) # [batch]
+                batch_min_errors = torch.minimum(batch_min_errors, errors)
+                
+                # Metric 2: Input-Output Correlation - BLIND
+                denoised_flat = denoised_hypothesis.view(batch_size, -1)
+                denoised_flat = denoised_flat - denoised_flat.mean(dim=1, keepdim=True)
+                denoised_norm = torch.norm(denoised_flat, dim=1, keepdim=True) + 1e-8
+                denoised_flat = denoised_flat / denoised_norm
+                corrs = (noisy_flat * denoised_flat).sum(dim=1)
+                batch_max_corrs = torch.maximum(batch_max_corrs, corrs)
+                
+                # Metric 3: SNR Improvement - BLIND
+                snr_out = estimate_snr(denoised_hypothesis)
+                imps = snr_out - snr_in
+                batch_max_snr_imps = torch.maximum(batch_max_snr_imps, imps)
+            
+            # Store OOD Scores and Labels
+            # Ground truth: 1 if OOD (label == -1), 0 if ID
+            is_ood = (labels == -1).cpu().numpy().astype(int)
+            ood_labels.extend(is_ood)
+            
+            # OOD Scores:
+            # 1. Min Error: Higher error = OOD. Score = Min Error
+            ood_min_errors.extend(batch_min_errors.cpu().numpy())
+            
+            # 2. Max Corr: Lower correlation = OOD. Score = -Max Corr
+            ood_max_corrs.extend(-batch_max_corrs.cpu().numpy())
+            
+            # 3. Max SNR Imp: Lower improvement = OOD. Score = -Max SNR Imp
+            ood_max_snr_imps.extend(-batch_max_snr_imps.cpu().numpy())
             
             # Per-sample metrics for SNR and modulation breakdown
             snr_values = info['snr'].numpy()
@@ -463,13 +594,35 @@ def evaluate(
                 modulation_metrics[mod]['snr_imp'].append(sample_metrics['snr_improvement'])
                 modulation_metrics[mod]['corr'].append(sample_metrics['correlation'])
     
+    # Calculate AUROC/AUPR for all metrics if we have both positive and negative classes
+    ood_labels_arr = np.array(ood_labels)
+    
+    # Helper to calculate metrics safely
+    def calc_ood_metrics(scores, name):
+        try:
+            if len(np.unique(ood_labels_arr)) > 1:
+                return {
+                    f'eval/ood_{name}_auroc': roc_auc_score(ood_labels_arr, scores),
+                    # f'eval/ood_{name}_aupr': average_precision_score(ood_labels_arr, scores)
+                }
+        except Exception as e:
+            logger.warning(f"Could not calculate OOD metrics for {name}: {e}")
+        return {f'eval/ood_{name}_auroc': 0.5}
+
+    mse_metrics = calc_ood_metrics(np.array(ood_min_errors), 'mse')
+    corr_metrics = calc_ood_metrics(np.array(ood_max_corrs), 'corr')
+    snr_metrics_ood = calc_ood_metrics(np.array(ood_max_snr_imps), 'snr')
+
     # Compile overall metrics
     metrics = {
         'eval/mse': np.mean(all_mse),
         'eval/nmse': np.mean(all_nmse),
         'eval/snr_improvement': np.mean(all_snr_improvement),
         'eval/correlation': np.mean(all_correlation),
-        'eval/psnr': np.mean(all_psnr)
+        'eval/psnr': np.mean(all_psnr),
+        **mse_metrics,
+        **corr_metrics,
+        **snr_metrics_ood
     }
     
     # Add per-SNR metrics

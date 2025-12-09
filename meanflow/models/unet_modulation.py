@@ -575,21 +575,9 @@ class ModulationUNet(nn.Module):
         
         # Add class embedding if provided
         if class_labels is not None:
-            # Handle unknown classes (-1)
-            valid_mask = class_labels >= 0
-            safe_labels = class_labels.clone()
-            safe_labels[~valid_mask] = 0
-            
             # Compute class-conditioned contribution
-            class_emb = self.class_embed(safe_labels)
+            class_emb = self.class_embed(class_labels)
             class_emb = self.class_proj(class_emb)
-            
-            # Use null embedding for unknown classes
-            if (~valid_mask).any():
-                null_row = self.null_class_time.to(dtype=class_emb.dtype, device=class_emb.device).unsqueeze(0)
-                class_emb = class_emb.clone()
-                class_emb[~valid_mask] = null_row.expand((~valid_mask).sum(), -1)
-            
             # Apply classifier-free guidance via a dedicated null embedding, not class 0
             if self.training and self.class_dropout > 0:
                 drop_mask = (torch.rand(class_labels.shape[0], device=x.device) < self.class_dropout)
@@ -688,20 +676,8 @@ class ModulationUNet(nn.Module):
 
         # Optionally add class embedding
         if class_labels is not None:
-            # Handle unknown classes (-1)
-            valid_mask = class_labels >= 0
-            safe_labels = class_labels.clone()
-            safe_labels[~valid_mask] = 0
-            
-            class_emb = self.class_embed(safe_labels)
+            class_emb = self.class_embed(class_labels)
             class_emb = self.class_proj(class_emb)
-            
-            # Use null embedding for unknown classes
-            if (~valid_mask).any():
-                null_row = self.null_class_time.to(dtype=class_emb.dtype, device=class_emb.device).unsqueeze(0)
-                class_emb = class_emb.clone()
-                class_emb[~valid_mask] = null_row.expand((~valid_mask).sum(), -1)
-            
             if self.training and self.class_dropout > 0:
                 drop_mask = (torch.rand(class_labels.shape[0], device=x.device) < self.class_dropout)
                 if drop_mask.any():

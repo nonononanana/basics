@@ -245,24 +245,8 @@ class DenoisingUNet(nn.Module):
         
         # Add class embedding if provided
         if class_labels is not None:
-            # Handle unknown classes (-1) for OOD evaluation
-            valid_mask = class_labels >= 0
-            
-            # Safe labels for embedding lookup (replace -1 with 0 temporarily)
-            # We use 0 as a placeholder for unknown classes, but we'll overwrite their embeddings later
-            safe_labels = class_labels.clone()
-            safe_labels[~valid_mask] = 0
-            
-            class_emb = self.class_embed(safe_labels)
+            class_emb = self.class_embed(class_labels)
             class_emb = self.class_proj(class_emb)
-            
-            # For unknown classes, use the null class embedding (same as CFG)
-            if (~valid_mask).any():
-                null_row = self.null_class_time.to(dtype=class_emb.dtype, device=class_emb.device).unsqueeze(0)
-                # Ensure we don't modify in-place if it affects gradients weirdly, though here it's fine
-                class_emb = class_emb.clone() 
-                class_emb[~valid_mask] = null_row.expand((~valid_mask).sum(), -1)
-
             # Apply classifier-free guidance
             if self.training and self.class_dropout > 0:
                 drop_mask = (torch.rand(class_labels.shape[0], device=x.device) < self.class_dropout)

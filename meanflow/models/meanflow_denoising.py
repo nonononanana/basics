@@ -135,52 +135,28 @@ class MeanFlowDenoising(nn.Module):
         device = x_noisy.device
         batch_size = x_noisy.shape[0]
         
-        # Sample two timesteps for mean flow
-        t, r = sample_two_timesteps(self.args, num_samples=batch_size, device=device)
+        # Sample timestep t
+        # We can still use sample_two_timesteps and ignore r, or just sample t
+        t, _ = sample_two_timesteps(self.args, num_samples=batch_size, device=device)
         # Reshape for 1D signal broadcasting [batch, 1, 1]
         t = t.view(-1, 1, 1)
-        r = r.view(-1, 1, 1)
         
         # Denoising flow: interpolate between clean (t=0) and noisy (t=1)
         # z_t = (1-t) * x_clean + t * x_noisy
-        # At t=0: z = x_clean (endpoint)
-        # At t=1: z = x_noisy (starting point)
         z = (1 - t) * x_clean + t * x_noisy
-        v = x_noisy - x_clean  # Velocity field: from clean to noisy direction
         
-        # Define network function with class conditioning
-        def u_func(z, t, r):
-            h = t - r
-            # Pass class labels for modulation conditioning
-            return self.net(
-                z, 
-                (t.view(-1), h.view(-1)), 
-                aug_cond,
-                class_labels=class_labels,
-                noisy_cond=None  # Don't pass noisy as separate condition during training
-            )
+        # Predict x_clean directly
+        # We pass h=t to indicate prediction target is at distance t (i.e. t=0)
+        x_pred = self.net(
+            z, 
+            (t.view(-1), t.view(-1)), 
+            aug_cond,
+            class_labels=class_labels,
+            noisy_cond=None
+        )
         
-        # Compute derivatives for mean flow
-        dtdt = torch.ones_like(t)
-        drdt = torch.zeros_like(r)
-        
-        with torch.amp.autocast("cuda", enabled=False):
-            # Compute predicted velocity and its derivative
-            u_pred, dudt = torch.func.jvp(u_func, (z, t, r), (v, dtdt, drdt))
-            
-            # Target velocity field
-            u_tgt = (v - (t - r) * dudt).detach()
-            
-            # Mean flow loss: learn velocity field at all time steps
-            # This single loss is sufficient for the model to learn the entire
-            # denoising trajectory from noisy (t=1) to clean (t=0)
-            loss = (u_pred - u_tgt)**2
-            loss = loss.mean(dim=(1, 2))  # Mean over channel and time dimensions
-            
-            # Adaptive weighting for stability
-            adp_wt = (loss.detach() + self.args.norm_eps) ** self.args.norm_p
-            loss = loss / adp_wt
-            loss = loss.mean()  # Mean over batch
+        # Loss: MSE between predicted and true clean signal
+        loss = F.mse_loss(x_pred, x_clean)
         
         return {
             'total_loss': loss,
@@ -216,19 +192,18 @@ class MeanFlowDenoising(nn.Module):
         device = x_noisy.device
         
         if num_steps == 1:
-            # Single-step denoising using mean flow
+            # Single-step denoising
             # Start from noisy signal at t=1
             z_1 = x_noisy
             t = torch.ones(batch_size, device=device)
-            r = torch.zeros(batch_size, device=device)
             
-            # Predict velocity field from noisy to clean
-            u = net(z_1, (t, t - r), aug_cond=None, class_labels=class_labels, noisy_cond=None)
+            # Predict clean signal directly
+            # h = t - 0 = t
+            x_pred = net(z_1, (t, t), aug_cond=None, class_labels=class_labels, noisy_cond=None)
             
-            # Move along the flow to get clean signal
-            x_clean = z_1 - u
+            x_clean = x_pred
         else:
-            # Multi-step denoising with Euler integration
+            # Multi-step denoising
             z = x_noisy.clone()
             dt = 1.0 / num_steps
             
@@ -236,11 +211,17 @@ class MeanFlowDenoising(nn.Module):
                 t_val = 1.0 - step * dt
                 t = torch.full((batch_size,), t_val, device=device)
                 
-                # Predict velocity at current position
-                u = net(z, (t, t), aug_cond=None, class_labels=class_labels, noisy_cond=None)
+                # Predict clean signal
+                x_pred = net(z, (t, t), aug_cond=None, class_labels=class_labels, noisy_cond=None)
                 
-                # Euler step: move towards clean signal
-                z = z - dt * u
+                # Compute implied velocity v = (z - x) / t
+                # Note: avoid division by zero at t=0
+                if t_val > 1e-5:
+                    u = (z - x_pred) / t_val
+                    # Euler step
+                    z = z - dt * u
+                else:
+                    z = x_pred
             
             x_clean = z
         

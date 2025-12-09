@@ -575,9 +575,23 @@ class ModulationUNet(nn.Module):
         
         # Add class embedding if provided
         if class_labels is not None:
+            # Handle unknown class labels (-1) by replacing them with null embedding
+            unknown_mask = (class_labels == -1)
+            
+            # For valid class labels, clamp to valid range [0, num_classes-1]
+            valid_labels = class_labels.clone()
+            valid_labels = torch.clamp(valid_labels, 0, self.num_classes - 1)
+            
             # Compute class-conditioned contribution
-            class_emb = self.class_embed(class_labels)
+            class_emb = self.class_embed(valid_labels)
             class_emb = self.class_proj(class_emb)
+            
+            # Replace unknown class labels with null embedding
+            if unknown_mask.any():
+                class_emb = class_emb.clone()
+                null_row = self.null_class_time.to(dtype=class_emb.dtype, device=class_emb.device).unsqueeze(0)
+                class_emb[unknown_mask] = null_row.expand(class_emb[unknown_mask].shape[0], -1)
+            
             # Apply classifier-free guidance via a dedicated null embedding, not class 0
             if self.training and self.class_dropout > 0:
                 drop_mask = (torch.rand(class_labels.shape[0], device=x.device) < self.class_dropout)
@@ -585,6 +599,7 @@ class ModulationUNet(nn.Module):
                     class_emb = class_emb.clone()
                     null_row = self.null_class_time.to(dtype=class_emb.dtype, device=class_emb.device).unsqueeze(0)
                     class_emb[drop_mask] = null_row.expand(class_emb[drop_mask].shape[0], -1)
+            
             # Add to time embedding
             time_emb = time_emb + class_emb
         
@@ -676,14 +691,31 @@ class ModulationUNet(nn.Module):
 
         # Optionally add class embedding
         if class_labels is not None:
-            class_emb = self.class_embed(class_labels)
+            # Handle unknown class labels (-1) by replacing them with null embedding
+            unknown_mask = (class_labels == -1)
+            
+            # For valid class labels, clamp to valid range [0, num_classes-1]
+            valid_labels = class_labels.clone()
+            valid_labels = torch.clamp(valid_labels, 0, self.num_classes - 1)
+            
+            # Get embeddings for all labels (using clamped values)
+            class_emb = self.class_embed(valid_labels)
             class_emb = self.class_proj(class_emb)
+            
+            # Replace unknown class labels with null embedding
+            if unknown_mask.any():
+                class_emb = class_emb.clone()
+                null_row = self.null_class_time.to(dtype=class_emb.dtype, device=class_emb.device).unsqueeze(0)
+                class_emb[unknown_mask] = null_row.expand(class_emb[unknown_mask].shape[0], -1)
+            
+            # Apply classifier-free guidance dropout during training
             if self.training and self.class_dropout > 0:
                 drop_mask = (torch.rand(class_labels.shape[0], device=x.device) < self.class_dropout)
                 if drop_mask.any():
                     class_emb = class_emb.clone()
                     null_row = self.null_class_time.to(dtype=class_emb.dtype, device=class_emb.device).unsqueeze(0)
                     class_emb[drop_mask] = null_row.expand(class_emb[drop_mask].shape[0], -1)
+            
             time_emb = time_emb + class_emb
 
         emb = silu(time_emb)

@@ -22,7 +22,7 @@ class DenoisingUNet(nn.Module):
     """
     UNet architecture for signal denoising
     Takes noisy signal as conditioning input
-    Learns to predict velocity field for clean signal generation
+    Learns to predict clean signal (x-prediction)
     """
     
     def __init__(
@@ -210,7 +210,7 @@ class DenoisingUNet(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        time_cond: Tuple[torch.Tensor, torch.Tensor],
+        t: torch.Tensor,
         aug_cond: Optional[torch.Tensor] = None,
         class_labels: Optional[torch.Tensor] = None,
         noisy_cond: Optional[torch.Tensor] = None,
@@ -221,14 +221,14 @@ class DenoisingUNet(nn.Module):
         
         Args:
             x: Input signal [batch, 2, 128] (diffusion state z_t)
-            time_cond: Time conditioning (t, h) tuple
+            t: Time conditioning tensor [batch]
             aug_cond: Augmentation conditioning (optional)
             class_labels: Class labels for modulation conditioning
             noisy_cond: Noisy signal for conditioning denoising
             snr_values: SNR values (not used, kept for API compatibility)
         
         Returns:
-            Output velocity field [batch, 2, 128]
+            Output clean signal prediction [batch, 2, 128]
         """
         # Ensure correct shape [batch, 2, 128]
         if x.dim() == 3 and x.shape[1] == 2 and x.shape[2] == 128:
@@ -237,16 +237,29 @@ class DenoisingUNet(nn.Module):
             batch_size = x.shape[0]
             x = x.view(batch_size, 2, 128)
         
-        # Extract time conditions
-        t, h = time_cond
-        
         # Compute time embedding
-        time_emb = self.time_embed(t) + self.time_embed(h)
+        time_emb = self.time_embed(t)
         
         # Add class embedding if provided
         if class_labels is not None:
-            class_emb = self.class_embed(class_labels)
+            # Handle null labels (-1) for inference (unconditional generation)
+            valid_mask = class_labels >= 0
+            
+            # Create safe labels for embedding lookup (replace -1 with 0)
+            # We use 0 as a placeholder, the embedding will be overwritten for null labels
+            safe_labels = torch.where(valid_mask, class_labels, torch.zeros_like(class_labels))
+            
+            class_emb = self.class_embed(safe_labels)
             class_emb = self.class_proj(class_emb)
+            
+            # Replace embeddings for null labels with null_class_time
+            if (~valid_mask).any():
+                null_row = self.null_class_time.to(dtype=class_emb.dtype, device=class_emb.device).unsqueeze(0)
+                # Ensure class_emb is not a view that shouldn't be modified
+                if class_emb.is_leaf or not class_emb.is_contiguous():
+                    class_emb = class_emb.clone()
+                class_emb[~valid_mask] = null_row.expand((~valid_mask).sum(), -1)
+
             # Apply classifier-free guidance
             if self.training and self.class_dropout > 0:
                 drop_mask = (torch.rand(class_labels.shape[0], device=x.device) < self.class_dropout)

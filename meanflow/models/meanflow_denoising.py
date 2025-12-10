@@ -156,8 +156,8 @@ class MeanFlowDenoising(nn.Module):
         loss = F.mse_loss(x_pred, x_clean)
         
         return {
-            'total_loss': loss,
-            'loss': loss
+            'loss': loss,
+            'total_loss': loss
         }
     
     def denoise(

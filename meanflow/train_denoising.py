@@ -75,6 +75,8 @@ def parse_args():
                        help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=2e-4,
                        help='Learning rate')
+    parser.add_argument('--no_lr_scaling', action='store_true',
+                       help='Disable automatic learning rate scaling based on model size')
     parser.add_argument('--warmup_epochs', type=int, default=5,
                        help='Number of warmup epochs')
     parser.add_argument('--ema_decay', type=float, default=0.999,
@@ -331,6 +333,7 @@ def train_epoch(
     
     # Initialize metrics
     total_loss = 0.0
+    total_grad_norm = 0.0
     num_batches = 0
     
     # Training loop with progress bar
@@ -366,9 +369,10 @@ def train_epoch(
             scaler.scale(loss).backward()
             
             # Gradient clipping
+            grad_norm = 0.0
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
             
             # Optimizer step
             scaler.step(optimizer)
@@ -387,8 +391,9 @@ def train_epoch(
             loss.backward()
             
             # Gradient clipping
+            grad_norm = 0.0
             if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
             
             # Optimizer step
             optimizer.step()
@@ -398,6 +403,7 @@ def train_epoch(
         
         # Update metrics
         total_loss += loss.item()
+        total_grad_norm += grad_norm
         num_batches += 1
         
         # Learning rate scheduler step
@@ -415,7 +421,8 @@ def train_epoch(
     # Compute average metrics
     metrics = {
         'train/loss': total_loss / num_batches,
-        'train/learning_rate': optimizer.param_groups[0]['lr']
+        'train/learning_rate': optimizer.param_groups[0]['lr'],
+        'train/grad_norm': total_grad_norm / num_batches
     }
     
     return metrics
@@ -743,10 +750,19 @@ def main():
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f'Model has {num_params:,} trainable parameters')
     
-    # Create optimizer
+    # Create optimizer with learning rate scaling for larger models
+    # Scale learning rate based on model size to maintain stability
+    if args.no_lr_scaling:
+        effective_lr = args.lr
+        logger.info(f'Using fixed LR: {effective_lr:.2e} (scaling disabled)')
+    else:
+        lr_scale = np.sqrt(32.0 / args.model_channels)  # Scale relative to baseline of 32 channels
+        effective_lr = args.lr * lr_scale
+        logger.info(f'Base LR: {args.lr:.2e}, Scaled LR: {effective_lr:.2e} (scale factor: {lr_scale:.3f})')
+    
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=args.lr,
+        lr=effective_lr,
         betas=(0.9, 0.999),
         weight_decay=args.weight_decay
     )

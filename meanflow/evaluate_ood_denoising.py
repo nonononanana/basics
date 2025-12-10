@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
+from scipy.stats import kurtosis, gmean
 
 from meanflow.data.rml_dataset import get_rml_denoising_dataloaders, EXPERIMENT_SETTINGS
 from meanflow.models.meanflow_denoising import MeanFlowDenoising
@@ -42,7 +43,7 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4,
                        help='Number of data loading workers')
     parser.add_argument('--method', type=str, default='min_error', 
-                       choices=['min_error', 'avg_error', 'improvement', 'snr_improvement', 'correlation'],
+                       choices=['min_error', 'avg_error', 'improvement', 'snr_improvement', 'correlation', 'mdrc'],
                        help='OOD scoring method')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                        help='Device to use')
@@ -163,13 +164,17 @@ def compute_ood_score_min_error(
     num_classes: int
 ) -> torch.Tensor:
     """
-    OOD score based on minimum reconstruction error across all known classes
-    Uses MSE between denoised and clean signal (not noisy input)
+    OOD score based on maximum output SNR across all known classes.
+    BLIND METHOD: Uses estimated SNR of denoised output.
+    
+    Intuition: For ID signals, denoising with the correct class produces
+    high-quality output with high estimated SNR. For OOD signals, all class
+    denoising attempts produce low-quality outputs with low SNR.
     
     Args:
         model: Trained denoising model
         noisy_signal: Noisy signal [batch, 2, 128]
-        clean_signal: Clean signal [batch, 2, 128]
+        clean_signal: Clean signal [batch, 2, 128] (UNUSED - for compatibility only)
         num_classes: Number of known classes
     
     Returns:
@@ -178,7 +183,7 @@ def compute_ood_score_min_error(
     batch_size = noisy_signal.shape[0]
     device = noisy_signal.device
     
-    min_errors = torch.full((batch_size,), float('inf'), device=device)
+    max_snr = torch.full((batch_size,), float('-inf'), device=device)
     
     # Try denoising with each known class
     for class_id in range(num_classes):
@@ -192,15 +197,18 @@ def compute_ood_score_min_error(
                 num_steps=1
             )
         
-        # Compute reconstruction error (MSE between denoised and clean signal)
-        # For unknown classes, the model cannot denoise well
-        errors = F.mse_loss(denoised, clean_signal, reduction='none')
-        errors = errors.mean(dim=(1, 2))  # [batch]
+        # Estimate SNR of denoised output (BLIND)
+        # High SNR = good signal quality = likely ID
+        # Low SNR = poor quality = likely OOD
+        snr = estimate_snr(denoised)
         
-        # Update minimum errors
-        min_errors = torch.minimum(min_errors, errors)
+        # Track maximum SNR across all classes
+        max_snr = torch.maximum(max_snr, snr)
     
-    return min_errors
+    # OOD score: negative SNR (high SNR = low OOD score)
+    ood_scores = -max_snr
+    
+    return ood_scores
 
 
 def compute_ood_score_avg_error(
@@ -210,12 +218,17 @@ def compute_ood_score_avg_error(
     num_classes: int
 ) -> torch.Tensor:
     """
-    OOD score based on average reconstruction error across all known classes
+    OOD score based on average output SNR across all known classes.
+    BLIND METHOD: Average the estimated SNR of all class-conditional denoising outputs.
+    
+    Intuition: For ID signals, the average SNR across all classes should be
+    reasonably high. For OOD signals, all denoising attempts fail, resulting
+    in low average SNR.
     
     Args:
         model: Trained denoising model
         noisy_signal: Noisy signal [batch, 2, 128]
-        clean_signal: Clean signal [batch, 2, 128]
+        clean_signal: Clean signal [batch, 2, 128] (UNUSED - for compatibility only)
         num_classes: Number of known classes
     
     Returns:
@@ -224,9 +237,9 @@ def compute_ood_score_avg_error(
     batch_size = noisy_signal.shape[0]
     device = noisy_signal.device
     
-    denoised_sum = torch.zeros_like(noisy_signal)
+    snr_sum = torch.zeros(batch_size, device=device)
     
-    # Average denoising over all known classes
+    # Average SNR over all known classes
     for class_id in range(num_classes):
         class_labels = torch.full((batch_size,), class_id, dtype=torch.long, device=device)
         
@@ -237,15 +250,16 @@ def compute_ood_score_avg_error(
                 num_steps=1
             )
         
-        denoised_sum += denoised
+        # Estimate SNR of denoised output (BLIND)
+        snr = estimate_snr(denoised)
+        snr_sum += snr
     
-    denoised_avg = denoised_sum / num_classes
+    snr_avg = snr_sum / num_classes
     
-    # Compute reconstruction error against clean signal
-    errors = F.mse_loss(denoised_avg, clean_signal, reduction='none')
-    errors = errors.mean(dim=(1, 2))
+    # OOD score: negative average SNR (high SNR = low OOD score)
+    ood_scores = -snr_avg
     
-    return errors
+    return ood_scores
 
 
 def compute_ood_score_improvement(
@@ -255,13 +269,17 @@ def compute_ood_score_improvement(
     num_classes: int
 ) -> torch.Tensor:
     """
-    OOD score based on denoising improvement
-    Compares error before and after denoising
+    OOD score based on denoising consistency across classes.
+    BLIND METHOD: Measures variance of outputs across different class labels.
+    
+    Intuition: For ID signals, different class denoising attempts should produce
+    similar outputs (consistency). For OOD signals, the model is confused and
+    different classes produce very different (inconsistent) outputs.
     
     Args:
         model: Trained denoising model
         noisy_signal: Noisy signal [batch, 2, 128]
-        clean_signal: Clean signal [batch, 2, 128]
+        clean_signal: Clean signal [batch, 2, 128] (UNUSED - for compatibility only)
         num_classes: Number of known classes
     
     Returns:
@@ -270,12 +288,8 @@ def compute_ood_score_improvement(
     batch_size = noisy_signal.shape[0]
     device = noisy_signal.device
     
-    # Error before denoising
-    noise_error = F.mse_loss(noisy_signal, clean_signal, reduction='none')
-    noise_error = noise_error.mean(dim=(1, 2))
-    
-    # Minimum error after denoising
-    min_denoised_error = torch.full((batch_size,), float('inf'), device=device)
+    # Collect all denoised outputs
+    all_denoised = []
     
     for class_id in range(num_classes):
         class_labels = torch.full((batch_size,), class_id, dtype=torch.long, device=device)
@@ -287,16 +301,19 @@ def compute_ood_score_improvement(
                 num_steps=1
             )
         
-        denoised_error = F.mse_loss(denoised, clean_signal, reduction='none')
-        denoised_error = denoised_error.mean(dim=(1, 2))
-        
-        min_denoised_error = torch.minimum(min_denoised_error, denoised_error)
+        all_denoised.append(denoised)
     
-    # Improvement: negative means denoising made it worse (likely OOD)
-    improvement = noise_error - min_denoised_error
+    # Stack: [num_classes, batch, 2, 128]
+    all_denoised = torch.stack(all_denoised, dim=0)
     
-    # OOD score: lower improvement = higher OOD likelihood
-    ood_scores = -improvement
+    # Compute variance across classes (BLIND)
+    # High variance = inconsistent = OOD
+    # Low variance = consistent = ID
+    variance = torch.var(all_denoised, dim=0)  # [batch, 2, 128]
+    inconsistency = variance.mean(dim=(1, 2))  # [batch]
+    
+    # OOD score: higher inconsistency = higher OOD likelihood
+    ood_scores = inconsistency
     
     return ood_scores
 
@@ -412,11 +429,225 @@ def compute_ood_score_correlation(
     return -max_corr
 
 
+def extract_residual_features(input_sig: torch.Tensor, denoised_sig: torch.Tensor) -> np.ndarray:
+    """
+    Extract multi-domain features from residual signal (input - denoised).
+    
+    Features:
+    1. Amplitude domain: Kurtosis of amplitude (for QAM, AM, PAM)
+    2. Phase/Frequency domain: Variance of 2nd-order phase difference (for GFSK, CPFSK, PSK)
+    3. Spectral domain: Spectral Flatness Measure (for SSB, DSB, WBFM)
+    
+    Args:
+        input_sig: Input signal [batch, 2, length] (I/Q channels)
+        denoised_sig: Denoised signal [batch, 2, length]
+        
+    Returns:
+        features: [batch, 3] feature vector
+    """
+    # Compute residual
+    residual = input_sig - denoised_sig  # [batch, 2, length]
+    
+    # Convert to complex for easier manipulation
+    # residual_complex = [batch, length]
+    residual_complex = residual[:, 0, :] + 1j * residual[:, 1, :]
+    
+    batch_size = residual_complex.shape[0]
+    features = np.zeros((batch_size, 3))
+    
+    # Convert to numpy
+    residual_np = residual_complex.cpu().numpy()
+    
+    for i in range(batch_size):
+        res = residual_np[i]
+        
+        # --- Feature 1: Amplitude domain (Kurtosis) ---
+        res_amp = np.abs(res)
+        feat_amp = kurtosis(res_amp)
+        
+        # --- Feature 2: Phase/Frequency domain (Smoothness of Instantaneous Frequency) ---
+        res_phase = np.unwrap(np.angle(res))
+        # 2nd order difference (frequency change rate)
+        res_freq_change = np.diff(res_phase, n=2)
+        # Log variance for smoothness measure
+        feat_phase = np.var(res_freq_change)
+        # Use kurtosis instead of variance for better discrimination
+        feat_phase = kurtosis(res_freq_change) if len(res_freq_change) > 0 else 0.0
+        
+        # --- Feature 3: Spectral domain (Spectral Flatness Measure) ---
+        # Compute power spectral density
+        f_res = np.fft.fft(res)
+        psd = np.abs(f_res)**2 + 1e-12  # Add small constant for numerical stability
+        
+        # Spectral Flatness Measure (SFM) = geometric_mean / arithmetic_mean
+        # Low SFM (~0) = tonal/narrowband (concentrated spectrum)
+        # High SFM (~1) = white noise (flat spectrum)
+        sfm = gmean(psd) / np.mean(psd)
+        
+        # For ID signals, residual should be close to white noise (high SFM)
+        # For OOD signals, residual contains structure (low SFM)
+        # Use -log(SFM) so higher value = more OOD
+        feat_spec = -np.log10(sfm + 1e-12)
+        
+        features[i] = [feat_amp, feat_phase, feat_spec]
+    
+    return features
+
+
+def compute_mahalanobis_statistics(
+    model: MeanFlowDenoising,
+    val_loader: DataLoader,
+    device: str
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute mean and covariance matrix from ID validation data.
+    
+    For ID validation samples with known labels, we denoise using the TRUE
+    class labels to obtain the residual feature distribution when the model
+    is used correctly. This defines the "normal" residual pattern for ID data.
+    
+    Args:
+        model: Trained denoising model
+        val_loader: Validation data loader (must contain ID samples with labels)
+        device: Device to use
+        
+    Returns:
+        mu: Mean feature vector [3] from ID residuals
+        cov_inv: Inverse covariance matrix [3, 3] from ID residuals
+    """
+    model.eval()
+    all_features = []
+    num_classes = model.num_classes
+    
+    logger.info('Computing Mahalanobis statistics from ID validation data...')
+    
+    with torch.no_grad():
+        for noisy_samples, clean_samples, labels, info in tqdm(val_loader, desc='Computing statistics'):
+            noisy_samples = noisy_samples.to(device)
+            
+            # Only use known class samples (ID samples with valid labels)
+            known_mask = labels >= 0
+            if known_mask.sum() == 0:
+                continue
+                
+            noisy_samples = noisy_samples[known_mask]
+            labels = labels[known_mask].to(device)
+            
+            # For ID validation samples, we DO have true labels
+            # Denoise using the correct class label to get "ideal" residuals
+            with torch.no_grad():
+                denoised = model.denoise(
+                    x_noisy=noisy_samples,
+                    class_labels=labels,
+                    num_steps=1
+                )
+            
+            # Extract features from residuals when model is used correctly
+            features = extract_residual_features(noisy_samples, denoised)
+            all_features.append(features)
+    
+    # Concatenate all features
+    all_features = np.concatenate(all_features, axis=0)
+    
+    # Compute statistics
+    mu = np.mean(all_features, axis=0)
+    cov = np.cov(all_features, rowvar=False)
+    
+    # Add regularization to ensure invertibility
+    cov = cov + np.eye(cov.shape[0]) * 1e-6
+    
+    # Compute inverse
+    cov_inv = np.linalg.inv(cov)
+    
+    logger.info(f'Computed statistics from {all_features.shape[0]} ID samples')
+    logger.info(f'Mean: {mu}')
+    logger.info(f'Covariance:\n{cov}')
+    
+    return mu, cov_inv
+
+
+def compute_ood_score_mdrc(
+    model: MeanFlowDenoising,
+    noisy_signal: torch.Tensor,
+    clean_signal: torch.Tensor,
+    num_classes: int,
+    mu: np.ndarray,
+    cov_inv: np.ndarray
+) -> torch.Tensor:
+    """
+    OOD score based on Multi-Domain Residual Complexity (MDRC).
+    BLIND METHOD: Only uses noisy input, no clean signal or true labels.
+    
+    Computes Mahalanobis distance using residual features from three domains:
+    - Amplitude (Kurtosis of |r[n]|)
+    - Phase/Frequency (Kurtosis of 2nd-order phase differences)
+    - Spectral (Spectral Flatness Measure)
+    
+    For each test sample:
+    1. Try denoising with all known class labels (blind - no true label)
+    2. Extract 3D feature vector from residual for each attempt
+    3. Compute Mahalanobis distance to ID distribution
+    4. Return minimum distance (best case scenario)
+    
+    Intuition:
+    - ID samples: At least one class produces "normal" residuals → low distance
+    - OOD samples: All classes produce abnormal residuals → high distance
+    
+    Args:
+        model: Trained denoising model
+        noisy_signal: Noisy signal [batch, 2, 128]
+        clean_signal: Clean signal [batch, 2, 128] (UNUSED - for API compatibility)
+        num_classes: Number of known classes
+        mu: Mean feature vector from ID data [3]
+        cov_inv: Inverse covariance matrix [3, 3]
+    
+    Returns:
+        ood_scores: Mahalanobis distances [batch] (higher = more likely OOD)
+    """
+    batch_size = noisy_signal.shape[0]
+    device = noisy_signal.device
+    
+    # For each sample, try all known classes and use minimum distance
+    min_distances = torch.full((batch_size,), float('inf'), device=device)
+    
+    for class_id in range(num_classes):
+        class_labels = torch.full((batch_size,), class_id, dtype=torch.long, device=device)
+        
+        # Denoise
+        with torch.no_grad():
+            denoised = model.denoise(
+                x_noisy=noisy_signal,
+                class_labels=class_labels,
+                num_steps=1
+            )
+        
+        # Extract residual features
+        features = extract_residual_features(noisy_signal, denoised)  # [batch, 3]
+        
+        # Compute Mahalanobis distance for each sample
+        distances = np.zeros(batch_size)
+        for i in range(batch_size):
+            delta = features[i] - mu  # [3]
+            # Mahalanobis distance: sqrt(delta^T @ cov_inv @ delta)
+            distance = np.sqrt(np.dot(np.dot(delta, cov_inv), delta.T))
+            distances[i] = distance
+        
+        # Convert to torch tensor
+        distances_torch = torch.from_numpy(distances).float().to(device)
+        
+        # Update minimum distances
+        min_distances = torch.minimum(min_distances, distances_torch)
+    
+    return min_distances
+
+
 def evaluate_ood_detection(
     model: MeanFlowDenoising,
     test_loader: DataLoader,
     method: str,
-    device: str
+    device: str,
+    mu: np.ndarray = None,
+    cov_inv: np.ndarray = None
 ) -> Dict[str, float]:
     """
     Evaluate OOD detection performance
@@ -424,8 +655,10 @@ def evaluate_ood_detection(
     Args:
         model: Trained denoising model
         test_loader: Test data loader
-        method: OOD scoring method ('min_error', 'avg_error', 'improvement')
+        method: OOD scoring method ('min_error', 'avg_error', 'improvement', 'mdrc')
         device: Device to use
+        mu: Mean feature vector for MDRC method (optional)
+        cov_inv: Inverse covariance matrix for MDRC method (optional)
     
     Returns:
         Dictionary of metrics
@@ -465,6 +698,12 @@ def evaluate_ood_detection(
             elif method == 'correlation':
                 ood_scores = compute_ood_score_correlation(
                     model, noisy_samples, clean_samples, model.num_classes
+                )
+            elif method == 'mdrc':
+                if mu is None or cov_inv is None:
+                    raise ValueError('MDRC method requires mu and cov_inv statistics')
+                ood_scores = compute_ood_score_mdrc(
+                    model, noisy_samples, clean_samples, model.num_classes, mu, cov_inv
                 )
             else:
                 raise ValueError(f'Unknown method: {method}')
@@ -534,7 +773,7 @@ def main():
     
     # Load test data
     logger.info('Loading test data...')
-    _, _, test_loader = get_rml_denoising_dataloaders(
+    _, val_loader, test_loader = get_rml_denoising_dataloaders(
         data_path=args.data_path,
         experiment_setting=args.experiment_setting,
         batch_size=args.batch_size,
@@ -543,12 +782,23 @@ def main():
         seed=42
     )
     
+    # Compute Mahalanobis statistics if using MDRC method
+    mu, cov_inv = None, None
+    if args.method == 'mdrc':
+        mu, cov_inv = compute_mahalanobis_statistics(
+            model=model,
+            val_loader=val_loader,
+            device=args.device
+        )
+    
     # Evaluate OOD detection
     metrics, ood_scores, labels, snrs, modulations = evaluate_ood_detection(
         model=model,
         test_loader=test_loader,
         method=args.method,
-        device=args.device
+        device=args.device,
+        mu=mu,
+        cov_inv=cov_inv
     )
     
     # Print results

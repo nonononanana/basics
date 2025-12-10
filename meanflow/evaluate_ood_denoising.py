@@ -7,7 +7,7 @@ import os
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import numpy as np
 import torch
@@ -16,6 +16,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 from scipy.stats import kurtosis, gmean
+import matplotlib.pyplot as plt
+import matplotlib
 
 from meanflow.data.rml_dataset import get_rml_denoising_dataloaders, EXPERIMENT_SETTINGS
 from meanflow.models.meanflow_denoising import MeanFlowDenoising
@@ -51,6 +53,10 @@ def parse_args():
                        help='Minimum SNR to evaluate')
     parser.add_argument('--snr_max', type=int, default=20,
                        help='Maximum SNR to evaluate')
+    parser.add_argument('--save_visualization', action='store_true',
+                       help='Save visualization images for MDRC method (one sample per class)')
+    parser.add_argument('--output_dir', type=str, default='.',
+                       help='Output directory for visualization images')
     
     return parser.parse_args()
 
@@ -429,6 +435,124 @@ def compute_ood_score_correlation(
     return -max_corr
 
 
+def save_mdrc_visualization(
+    noisy_signal: torch.Tensor,
+    denoised_signal: torch.Tensor,
+    class_id: int,
+    output_dir: Path
+) -> None:
+    """
+    Save visualization of noisy, denoised, and residual signals for MDRC analysis.
+    
+    Args:
+        noisy_signal: Noisy signal [2, length] (I/Q channels)
+        denoised_signal: Denoised signal [2, length]
+        class_id: Class ID for labeling
+        output_dir: Directory to save images
+    """
+    # Convert to numpy and move to CPU
+    noisy_np = noisy_signal.cpu().numpy()  # [2, length]
+    denoised_np = denoised_signal.cpu().numpy()  # [2, length]
+    residual_np = noisy_np - denoised_np  # [2, length]
+    
+    # Convert to complex for better visualization
+    noisy_complex = noisy_np[0] + 1j * noisy_np[1]
+    denoised_complex = denoised_np[0] + 1j * denoised_np[1]
+    residual_complex = residual_np[0] + 1j * residual_np[1]
+    
+    # Set matplotlib to use non-interactive backend
+    matplotlib.use('Agg')
+    
+    # 1. Plot noisy signal
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+    
+    ax1.plot(noisy_np[0], label='I channel', alpha=0.7)
+    ax1.plot(noisy_np[1], label='Q channel', alpha=0.7)
+    ax1.set_title(f'Class {class_id}: Noisy Signal (Time Domain)')
+    ax1.set_xlabel('Sample')
+    ax1.set_ylabel('Amplitude')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    ax2.scatter(noisy_np[0], noisy_np[1], alpha=0.5, s=10)
+    ax2.set_title(f'Class {class_id}: Noisy Signal (I/Q Constellation)')
+    ax2.set_xlabel('I')
+    ax2.set_ylabel('Q')
+    ax2.grid(True, alpha=0.3)
+    ax2.axis('equal')
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / f'class_{class_id:02d}_noisy.png', dpi=100, bbox_inches='tight')
+    plt.close()
+    
+    # 2. Plot denoised signal
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+    
+    ax1.plot(denoised_np[0], label='I channel', alpha=0.7)
+    ax1.plot(denoised_np[1], label='Q channel', alpha=0.7)
+    ax1.set_title(f'Class {class_id}: Denoised Signal (Time Domain)')
+    ax1.set_xlabel('Sample')
+    ax1.set_ylabel('Amplitude')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    ax2.scatter(denoised_np[0], denoised_np[1], alpha=0.5, s=10)
+    ax2.set_title(f'Class {class_id}: Denoised Signal (I/Q Constellation)')
+    ax2.set_xlabel('I')
+    ax2.set_ylabel('Q')
+    ax2.grid(True, alpha=0.3)
+    ax2.axis('equal')
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / f'class_{class_id:02d}_denoised.png', dpi=100, bbox_inches='tight')
+    plt.close()
+    
+    # 3. Plot residual signal
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # Time domain
+    ax1.plot(residual_np[0], label='I channel', alpha=0.7)
+    ax1.plot(residual_np[1], label='Q channel', alpha=0.7)
+    ax1.set_title(f'Class {class_id}: Residual Signal (Time Domain)')
+    ax1.set_xlabel('Sample')
+    ax1.set_ylabel('Amplitude')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # I/Q constellation
+    ax2.scatter(residual_np[0], residual_np[1], alpha=0.5, s=10)
+    ax2.set_title(f'Class {class_id}: Residual Signal (I/Q Constellation)')
+    ax2.set_xlabel('I')
+    ax2.set_ylabel('Q')
+    ax2.grid(True, alpha=0.3)
+    ax2.axis('equal')
+    
+    # Amplitude
+    residual_amp = np.abs(residual_complex)
+    ax3.plot(residual_amp, color='purple', alpha=0.7)
+    ax3.set_title(f'Class {class_id}: Residual Amplitude')
+    ax3.set_xlabel('Sample')
+    ax3.set_ylabel('Amplitude')
+    ax3.grid(True, alpha=0.3)
+    
+    # Frequency domain
+    residual_fft = np.fft.fft(residual_complex)
+    residual_psd = np.abs(residual_fft)**2
+    freq = np.fft.fftfreq(len(residual_complex))
+    ax4.plot(np.fft.fftshift(freq), np.fft.fftshift(10 * np.log10(residual_psd + 1e-12)), 
+             color='red', alpha=0.7)
+    ax4.set_title(f'Class {class_id}: Residual Power Spectral Density')
+    ax4.set_xlabel('Normalized Frequency')
+    ax4.set_ylabel('Power (dB)')
+    ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / f'class_{class_id:02d}_residual.png', dpi=100, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f'Saved visualization for class {class_id} to {output_dir}')
+
+
 def extract_residual_features(input_sig: torch.Tensor, denoised_sig: torch.Tensor) -> np.ndarray:
     """
     Extract multi-domain features from residual signal (input - denoised).
@@ -569,7 +693,9 @@ def compute_ood_score_mdrc(
     clean_signal: torch.Tensor,
     num_classes: int,
     mu: np.ndarray,
-    cov_inv: np.ndarray
+    cov_inv: np.ndarray,
+    save_visualization: bool = False,
+    output_dir: Optional[str] = None
 ) -> torch.Tensor:
     """
     OOD score based on Multi-Domain Residual Complexity (MDRC).
@@ -597,12 +723,19 @@ def compute_ood_score_mdrc(
         num_classes: Number of known classes
         mu: Mean feature vector from ID data [3]
         cov_inv: Inverse covariance matrix [3, 3]
+        save_visualization: If True, save visualization images for each class
+        output_dir: Directory to save visualization images
     
     Returns:
         ood_scores: Mahalanobis distances [batch] (higher = more likely OOD)
     """
     batch_size = noisy_signal.shape[0]
     device = noisy_signal.device
+    
+    # Create output directory if visualization is requested
+    if save_visualization and output_dir is not None:
+        vis_dir = Path(output_dir) / 'eval_mdrc'
+        vis_dir.mkdir(parents=True, exist_ok=True)
     
     # For each sample, try all known classes and use minimum distance
     min_distances = torch.full((batch_size,), float('inf'), device=device)
@@ -616,6 +749,15 @@ def compute_ood_score_mdrc(
                 x_noisy=noisy_signal,
                 class_labels=class_labels,
                 num_steps=1
+            )
+        
+        # Save visualization for the first sample of each class
+        if save_visualization and output_dir is not None and class_id < num_classes:
+            save_mdrc_visualization(
+                noisy_signal[0],
+                denoised[0],
+                class_id,
+                vis_dir
             )
         
         # Extract residual features
@@ -641,7 +783,9 @@ def evaluate_ood_detection(
     method: str,
     device: str,
     mu: np.ndarray = None,
-    cov_inv: np.ndarray = None
+    cov_inv: np.ndarray = None,
+    save_visualization: bool = False,
+    output_dir: Optional[str] = None
 ) -> Dict[str, float]:
     """
     Evaluate OOD detection performance
@@ -653,6 +797,8 @@ def evaluate_ood_detection(
         device: Device to use
         mu: Mean feature vector for MDRC method (optional)
         cov_inv: Inverse covariance matrix for MDRC method (optional)
+        save_visualization: If True, save visualization images for MDRC method
+        output_dir: Directory to save visualization images
     
     Returns:
         Dictionary of metrics
@@ -663,6 +809,9 @@ def evaluate_ood_detection(
     all_labels = []  # 0=known, 1=unknown
     all_snrs = []
     all_modulations = []
+    
+    # Flag to save visualization only once (first batch)
+    visualization_saved = False
     
     # Collect OOD scores
     logger.info(f'Computing OOD scores using method: {method}')
@@ -696,9 +845,14 @@ def evaluate_ood_detection(
             elif method == 'mdrc':
                 if mu is None or cov_inv is None:
                     raise ValueError('MDRC method requires mu and cov_inv statistics')
+                # Save visualization only for first batch
+                should_visualize = save_visualization and not visualization_saved
                 ood_scores = compute_ood_score_mdrc(
-                    model, noisy_samples, clean_samples, model.num_classes, mu, cov_inv
+                    model, noisy_samples, clean_samples, model.num_classes, mu, cov_inv,
+                    save_visualization=should_visualize, output_dir=output_dir
                 )
+                if should_visualize:
+                    visualization_saved = True
             else:
                 raise ValueError(f'Unknown method: {method}')
             
@@ -792,7 +946,9 @@ def main():
         method=args.method,
         device=args.device,
         mu=mu,
-        cov_inv=cov_inv
+        cov_inv=cov_inv,
+        save_visualization=args.save_visualization,
+        output_dir=args.output_dir
     )
     
     # Print results

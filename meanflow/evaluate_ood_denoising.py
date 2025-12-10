@@ -453,43 +453,40 @@ def extract_residual_features(input_sig: torch.Tensor, denoised_sig: torch.Tenso
     residual_complex = residual[:, 0, :] + 1j * residual[:, 1, :]
     
     batch_size = residual_complex.shape[0]
-    features = np.zeros((batch_size, 3))
     
     # Convert to numpy
     residual_np = residual_complex.cpu().numpy()
     
+    # --- Feature 1: Amplitude domain (Kurtosis) - Vectorized ---
+    res_amp = np.abs(residual_np)  # [batch, length]
+    feat_amp = kurtosis(res_amp, axis=1)  # [batch]
+    
+    # --- Feature 2: Phase/Frequency domain - Vectorized ---
+    res_phase = np.angle(residual_np)  # [batch, length]
+    # Unwrap phase for each sample (unfortunately np.unwrap doesn't vectorize directly)
+    res_phase_unwrapped = np.empty_like(res_phase)
     for i in range(batch_size):
-        res = residual_np[i]
-        
-        # --- Feature 1: Amplitude domain (Kurtosis) ---
-        res_amp = np.abs(res)
-        feat_amp = kurtosis(res_amp)
-        
-        # --- Feature 2: Phase/Frequency domain (Smoothness of Instantaneous Frequency) ---
-        res_phase = np.unwrap(np.angle(res))
-        # 2nd order difference (frequency change rate)
-        res_freq_change = np.diff(res_phase, n=2)
-        # Log variance for smoothness measure
-        feat_phase = np.var(res_freq_change)
-        # Use kurtosis instead of variance for better discrimination
-        feat_phase = kurtosis(res_freq_change) if len(res_freq_change) > 0 else 0.0
-        
-        # --- Feature 3: Spectral domain (Spectral Flatness Measure) ---
-        # Compute power spectral density
-        f_res = np.fft.fft(res)
-        psd = np.abs(f_res)**2 + 1e-12  # Add small constant for numerical stability
-        
-        # Spectral Flatness Measure (SFM) = geometric_mean / arithmetic_mean
-        # Low SFM (~0) = tonal/narrowband (concentrated spectrum)
-        # High SFM (~1) = white noise (flat spectrum)
-        sfm = gmean(psd) / np.mean(psd)
-        
-        # For ID signals, residual should be close to white noise (high SFM)
-        # For OOD signals, residual contains structure (low SFM)
-        # Use -log(SFM) so higher value = more OOD
-        feat_spec = -np.log10(sfm + 1e-12)
-        
-        features[i] = [feat_amp, feat_phase, feat_spec]
+        res_phase_unwrapped[i] = np.unwrap(res_phase[i])
+    
+    # 2nd order difference (frequency change rate)
+    res_freq_change = np.diff(res_phase_unwrapped, n=2, axis=1)  # [batch, length-2]
+    # Use kurtosis for better discrimination
+    feat_phase = kurtosis(res_freq_change, axis=1)  # [batch]
+    
+    # --- Feature 3: Spectral domain (Spectral Flatness Measure) - Vectorized ---
+    # Compute power spectral density
+    f_res = np.fft.fft(residual_np, axis=1)  # [batch, length]
+    psd = np.abs(f_res)**2 + 1e-12  # [batch, length]
+    
+    # Spectral Flatness Measure (SFM) = geometric_mean / arithmetic_mean
+    # gmean and mean across the frequency axis (axis=1)
+    sfm = gmean(psd, axis=1) / np.mean(psd, axis=1)  # [batch]
+    
+    # Use -log(SFM) so higher value = more OOD
+    feat_spec = -np.log10(sfm + 1e-12)  # [batch]
+    
+    # Stack features
+    features = np.stack([feat_amp, feat_phase, feat_spec], axis=1)  # [batch, 3]
     
     return features
 
@@ -624,13 +621,10 @@ def compute_ood_score_mdrc(
         # Extract residual features
         features = extract_residual_features(noisy_signal, denoised)  # [batch, 3]
         
-        # Compute Mahalanobis distance for each sample
-        distances = np.zeros(batch_size)
-        for i in range(batch_size):
-            delta = features[i] - mu  # [3]
-            # Mahalanobis distance: sqrt(delta^T @ cov_inv @ delta)
-            distance = np.sqrt(np.dot(np.dot(delta, cov_inv), delta.T))
-            distances[i] = distance
+        # Compute Mahalanobis distance for all samples (vectorized)
+        delta = features - mu  # [batch_size, 3] - broadcasting
+        # Efficient batch Mahalanobis: sqrt(sum((delta @ cov_inv) * delta, axis=1))
+        distances = np.sqrt(np.sum((delta @ cov_inv) * delta, axis=1))  # [batch_size]
         
         # Convert to torch tensor
         distances_torch = torch.from_numpy(distances).float().to(device)

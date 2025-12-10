@@ -156,7 +156,17 @@ class MeanFlowDenoising(nn.Module):
         )
         
         # Loss: MSE between predicted and true clean signal
-        loss = F.mse_loss(x_pred, x_clean)
+        # Compute per-sample loss for adaptive weighting
+        loss = F.mse_loss(x_pred, x_clean, reduction='none')  # [batch, 2, 128]
+        loss = loss.mean(dim=(1, 2))  # [batch] - mean over channel and signal dimensions
+        
+        # Adaptive weighting for stability
+        # This prevents outlier samples with high loss from dominating gradients
+        adp_wt = (loss.detach() + self.args.norm_eps) ** self.args.norm_p
+        loss = loss / adp_wt
+        
+        # Final loss: mean over batch
+        loss = loss.mean()
         
         return {
             'total_loss': loss,

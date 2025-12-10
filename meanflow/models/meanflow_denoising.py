@@ -9,8 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Tuple, Dict, List
-
-from meanflow.models.time_sampler import sample_two_timesteps
 from meanflow.models.ema import init_ema, update_ema_net
 import logging
 
@@ -120,8 +118,7 @@ class MeanFlowDenoising(nn.Module):
         """
         Forward pass with loss computation for denoising task
         
-        The mean flow learns to predict the velocity field that transforms
-        noisy signals to clean signals, conditioned on modulation type.
+        Learns to predict x_clean from x_noisy.
         
         Args:
             x_noisy: Noisy signal data [batch_size, 2, 128] (I/Q channels)
@@ -135,38 +132,28 @@ class MeanFlowDenoising(nn.Module):
         device = x_noisy.device
         batch_size = x_noisy.shape[0]
         
-        # Sample timestep t
-        # We can still use sample_two_timesteps and ignore r, or just sample t
-        t, _ = sample_two_timesteps(self.args, num_samples=batch_size, device=device)
-        # Reshape for 1D signal broadcasting [batch, 1, 1]
-        t = t.view(-1, 1, 1)
+        # Sample timestep t uniformly from [0, 1]
+        t = torch.rand(batch_size, device=device)
         
-        # Denoising flow: interpolate between clean (t=0) and noisy (t=1)
-        # z_t = (1-t) * x_clean + t * x_noisy
-        z = (1 - t) * x_clean + t * x_noisy
+        # Reshape for broadcasting
+        t_reshaped = t.view(-1, 1, 1)
         
-        # Predict x_clean directly
-        # We pass h=t to indicate prediction target is at distance t (i.e. t=0)
+        # Linear interpolation between clean (t=0) and noisy (t=1)
+        z = (1 - t_reshaped) * x_clean + t_reshaped * x_noisy
+        
+        # Predict clean signal directly
+        # We pass t for time embedding. 
+        # Note: We now pass single t instead of (t, t) tuple as we simplify UNet interface
         x_pred = self.net(
             z, 
-            (t.view(-1), t.view(-1)), 
+            t, 
             aug_cond,
             class_labels=class_labels,
             noisy_cond=None
         )
         
-        # Loss: MSE between predicted and true clean signal
-        # Compute per-sample loss for adaptive weighting
-        loss = F.mse_loss(x_pred, x_clean, reduction='none')  # [batch, 2, 128]
-        loss = loss.mean(dim=(1, 2))  # [batch] - mean over channel and signal dimensions
-        
-        # Adaptive weighting for stability
-        # This prevents outlier samples with high loss from dominating gradients
-        adp_wt = (loss.detach() + self.args.norm_eps) ** self.args.norm_p
-        loss = loss / adp_wt
-        
-        # Final loss: mean over batch
-        loss = loss.mean()
+        # Simple MSE loss on x prediction
+        loss = F.mse_loss(x_pred, x_clean)
         
         return {
             'total_loss': loss,
@@ -183,11 +170,6 @@ class MeanFlowDenoising(nn.Module):
         """
         Denoise a noisy signal conditioned on modulation type
         
-        For mean flow with single-step inference:
-        - Start from z_1 = x_noisy (t=1 position)
-        - Compute u(z_1, t=1, h=1) to get the velocity
-        - Get x_clean = z_1 - u = x_noisy - u
-        
         Args:
             x_noisy: Noisy input signal [batch_size, 2, 128]
             class_labels: Class labels for conditional denoising
@@ -202,18 +184,15 @@ class MeanFlowDenoising(nn.Module):
         device = x_noisy.device
         
         if num_steps == 1:
-            # Single-step denoising
-            # Start from noisy signal at t=1
-            z_1 = x_noisy
+            # Single-step prediction: directly predict x_clean from x_noisy (t=1)
+            z = x_noisy
             t = torch.ones(batch_size, device=device)
             
-            # Predict clean signal directly
-            # h = t - 0 = t
-            x_pred = net(z_1, (t, t), aug_cond=None, class_labels=class_labels, noisy_cond=None)
-            
+            x_pred = net(z, t, aug_cond=None, class_labels=class_labels, noisy_cond=None)
             x_clean = x_pred
         else:
-            # Multi-step denoising
+            # Multi-step sampling using Euler method on the ODE
+            # ODE: dz/dt = v = (z - x) / t
             z = x_noisy.clone()
             dt = 1.0 / num_steps
             
@@ -221,18 +200,18 @@ class MeanFlowDenoising(nn.Module):
                 t_val = 1.0 - step * dt
                 t = torch.full((batch_size,), t_val, device=device)
                 
-                # Predict clean signal
-                x_pred = net(z, (t, t), aug_cond=None, class_labels=class_labels, noisy_cond=None)
+                # Predict x_clean at current step
+                x_pred = net(z, t, aug_cond=None, class_labels=class_labels, noisy_cond=None)
                 
-                # Compute implied velocity v = (z - x) / t
-                # Note: avoid division by zero at t=0
+                # Compute velocity: v = (z - x) / t
+                # Avoid division by zero at t=0
                 if t_val > 1e-5:
-                    u = (z - x_pred) / t_val
-                    # Euler step
-                    z = z - dt * u
+                    v = (z - x_pred) / t_val
+                    # Euler update: z_{t-dt} = z_t - v * dt
+                    z = z - v * dt
                 else:
                     z = x_pred
-            
+
             x_clean = z
         
         return x_clean

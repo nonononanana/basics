@@ -119,3 +119,4 @@ If training still shows instability, consider:
 - Also used in the modulation classification model (`meanflow/models/meanflow_modulation.py`)
 - Based on adaptive loss scaling principles from robust optimization literature
 
+

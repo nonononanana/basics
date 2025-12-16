@@ -242,24 +242,8 @@ class DenoisingUNet(nn.Module):
         
         # Add class embedding if provided
         if class_labels is not None:
-            # Handle null labels (-1) for inference (unconditional generation)
-            valid_mask = class_labels >= 0
-            
-            # Create safe labels for embedding lookup (replace -1 with 0)
-            # We use 0 as a placeholder, the embedding will be overwritten for null labels
-            safe_labels = torch.where(valid_mask, class_labels, torch.zeros_like(class_labels))
-            
-            class_emb = self.class_embed(safe_labels)
             class_emb = self.class_proj(class_emb)
             
-            # Replace embeddings for null labels with null_class_time
-            if (~valid_mask).any():
-                null_row = self.null_class_time.to(dtype=class_emb.dtype, device=class_emb.device).unsqueeze(0)
-                # Ensure class_emb is not a view that shouldn't be modified
-                if class_emb.is_leaf or not class_emb.is_contiguous():
-                    class_emb = class_emb.clone()
-                class_emb[~valid_mask] = null_row.expand((~valid_mask).sum(), -1)
-
             # Apply classifier-free guidance
             if self.training and self.class_dropout > 0:
                 drop_mask = (torch.rand(class_labels.shape[0], device=x.device) < self.class_dropout)

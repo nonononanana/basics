@@ -63,7 +63,7 @@ def parse_args():
                        help='Dropout probability')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
                        help='Weight decay for regularization')
-    parser.add_argument('--class_dropout', type=float, default=0.1,
+    parser.add_argument('--class_dropout', type=float, default=0,
                        help='Class dropout for classifier-free guidance')
     
     # Training arguments
@@ -111,6 +111,10 @@ def parse_args():
     # Data preprocessing arguments
     parser.add_argument('--normalize', action='store_true', default=False,
                        help='Normalize I/Q samples in the dataset')
+    
+    # Masked Autoencoder arguments
+    parser.add_argument('--mask_ratio', type=float, default=0.0,
+                       help='Ratio of signal length to mask (0.0-1.0). Applied to both I/Q channels.')
     
     # Evaluation arguments
     parser.add_argument('--eval_freq', type=int, default=5,
@@ -336,6 +340,16 @@ def train_epoch(
     total_grad_norm = 0.0
     num_batches = 0
     
+    # #region agent log
+    import json
+    DEBUG_LOG_PATH = "/Users/Axer/Desktop/py-meanflow/.cursor/debug.log"
+    def debug_log(data):
+        try:
+            with open(DEBUG_LOG_PATH, 'a') as f:
+                f.write(json.dumps({**data, 'timestamp': int(time.time()*1000), 'sessionId': 'debug-session'}) + '\n')
+        except: pass
+    # #endregion
+    
     # Training loop with progress bar
     progress_bar = tqdm(
         enumerate(train_loader), 
@@ -373,6 +387,37 @@ def train_epoch(
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
+            
+            # #region agent log - Hypothesis A,C,D,E: Check for gradient explosion, FP16 overflow, attention/embedding issues
+            if batch_idx < 5 or (batch_idx % 50 == 0):
+                scaler_scale = scaler.get_scale()
+                input_max = noisy_samples.abs().max().item()
+                input_mean = noisy_samples.abs().mean().item()
+                loss_val = loss.item()
+                # Check for inf/nan in loss
+                loss_is_inf = float('inf') if loss_val == float('inf') else (float('nan') if loss_val != loss_val else loss_val)
+                # Check weight stats from first conv layer
+                first_conv_weight_max = model.net.init_conv.weight.abs().max().item()
+                first_conv_weight_mean = model.net.init_conv.weight.abs().mean().item()
+                # Time embedding layer stats
+                time_emb_weight_max = model.net.time_embed[1].weight.abs().max().item()
+                time_emb_weight_mean = model.net.time_embed[1].weight.abs().mean().item()
+                # Class embedding stats  
+                class_emb_weight_max = model.net.class_embed.weight.abs().max().item()
+                class_emb_weight_mean = model.net.class_embed.weight.abs().mean().item()
+                debug_log({
+                    'location': 'train_denoising.py:train_epoch', 'hypothesisId': 'A_C_D_E',
+                    'message': 'Training step metrics',
+                    'data': {
+                        'epoch': epoch, 'batch_idx': batch_idx, 'model_channels': args.model_channels,
+                        'loss': loss_val, 'grad_norm': grad_norm, 'scaler_scale': scaler_scale,
+                        'input_max': input_max, 'input_mean': input_mean,
+                        'first_conv_weight_max': first_conv_weight_max, 'first_conv_weight_mean': first_conv_weight_mean,
+                        'time_emb_weight_max': time_emb_weight_max, 'time_emb_weight_mean': time_emb_weight_mean,
+                        'class_emb_weight_max': class_emb_weight_max, 'class_emb_weight_mean': class_emb_weight_mean,
+                    }
+                })
+            # #endregion
             
             # Optimizer step
             scaler.step(optimizer)
@@ -484,37 +529,15 @@ def evaluate(
             clean_samples = clean_samples.to(args.device)
             labels = labels.to(args.device)
             
-            # --- Standard Denoising Evaluation (using provided labels) ---
-            # For OOD/Unknown labels (-1), this uses the null embedding (via previous fix)
-            clean_pred = model.denoise(
-                x_noisy=noisy_samples,
-                class_labels=labels,
-                num_steps=1
-            )
-            
-            # Compute batch metrics
-            batch_metrics = compute_denoising_metrics(
-                x_clean_pred=clean_pred,
-                x_clean_true=clean_samples,
-                x_noisy=noisy_samples
-            )
-            
-            all_mse.append(batch_metrics['mse'])
-            all_nmse.append(batch_metrics['nmse'])
-            all_snr_improvement.append(batch_metrics['snr_improvement'])
-            all_correlation.append(batch_metrics['correlation'])
-            all_psnr.append(batch_metrics['psnr'])
-
-            # --- OOD Evaluation: Polling Strategy ---
-            # Assume we don't know the label (even for known classes), and try all known classes.
-            # This gives us the "Best Fit" metrics.
-            
             batch_size = noisy_samples.shape[0]
             
             # Initialize "Best Fit" metrics
             batch_min_errors = torch.full((batch_size,), float('inf'), device=args.device)
             batch_max_corrs = torch.full((batch_size,), -1.0, device=args.device)
             batch_max_snr_imps = torch.full((batch_size,), float('-inf'), device=args.device)
+            
+            # Store best denoised result for each sample
+            best_denoised = torch.zeros_like(noisy_samples)
             
             # Estimate input SNR for blind metric
             snr_in = estimate_snr(noisy_samples)
@@ -541,6 +564,10 @@ def evaluate(
                 # Note: This uses Ground Truth Clean Signal, so it's an "Oracle" metric
                 errors = F.mse_loss(denoised_hypothesis, clean_samples, reduction='none')
                 errors = errors.mean(dim=(1, 2)) # [batch]
+                
+                # Update best denoised result when we find lower error
+                better_mask = errors < batch_min_errors
+                best_denoised[better_mask] = denoised_hypothesis[better_mask]
                 batch_min_errors = torch.minimum(batch_min_errors, errors)
                 
                 # Metric 2: Input-Output Correlation - BLIND
@@ -571,6 +598,19 @@ def evaluate(
             # 3. Max SNR Imp: Lower improvement = OOD. Score = -Max SNR Imp
             ood_max_snr_imps.extend(-batch_max_snr_imps.cpu().numpy())
             
+            # Compute batch metrics using best denoised result
+            batch_metrics = compute_denoising_metrics(
+                x_clean_pred=best_denoised,
+                x_clean_true=clean_samples,
+                x_noisy=noisy_samples
+            )
+            
+            all_mse.append(batch_metrics['mse'])
+            all_nmse.append(batch_metrics['nmse'])
+            all_snr_improvement.append(batch_metrics['snr_improvement'])
+            all_correlation.append(batch_metrics['correlation'])
+            all_psnr.append(batch_metrics['psnr'])
+            
             # Per-sample metrics for SNR and modulation breakdown
             snr_values = info['snr'].numpy()
             modulations = info['original_modulation']
@@ -581,7 +621,7 @@ def evaluate(
                 mod = modulations[i]
                 
                 # Per-sample metrics
-                sample_pred = clean_pred[i:i+1]
+                sample_pred = best_denoised[i:i+1]
                 sample_true = clean_samples[i:i+1]
                 sample_noisy = noisy_samples[i:i+1]
                 
@@ -645,7 +685,7 @@ def evaluate(
         metrics[f'eval/mod_{mod}/correlation'] = np.mean(mod_data['corr'])
     
     # Log summary
-    logger.info(f'\nDenoising Evaluation Results:')
+    logger.info(f'\nDenoising Evaluation Results (Best Hypothesis):')
     logger.info(f'  Overall MSE: {metrics["eval/mse"]:.6f}')
     logger.info(f'  Overall NMSE: {metrics["eval/nmse"]:.6f}')
     logger.info(f'  SNR Improvement: {metrics["eval/snr_improvement"]:.2f} dB')
@@ -739,7 +779,8 @@ def main():
         val_split=0.1,
         test_split=0.1,
         normalize=args.normalize,
-        seed=args.seed
+        seed=args.seed,
+        mask_ratio=args.mask_ratio  # Apply masked autoencoder training
     )
     
     # Create model

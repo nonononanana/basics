@@ -259,3 +259,5 @@ A: 可以！将MSE score和energy score融合可能获得更好的OOD检测性�
 
 
 
+
+

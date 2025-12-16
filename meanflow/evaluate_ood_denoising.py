@@ -108,13 +108,14 @@ def load_model(checkpoint_path: str, device: str) -> MeanFlowDenoising:
     return model
 
 
-def estimate_snr(signal: torch.Tensor) -> torch.Tensor:
+def estimate_snr(signal: torch.Tensor, debug_modulation: Optional[str] = None) -> torch.Tensor:
     """
     Estimate SNR of a signal batch using M2M4 estimator.
     Assumes complex signal structure (I/Q channels).
     
     Args:
         signal: [batch, 2, length]
+        debug_modulation: Optional modulation name for debugging
         
     Returns:
         Estimated SNR in dB [batch]
@@ -160,6 +161,26 @@ def estimate_snr(signal: torch.Tensor) -> torch.Tensor:
     # Set invalid estimates to a low value
     snr_db[~valid_mask] = -20.0
     
+    # #region agent log - Hypothesis G: Check M2M4 estimator behavior for FSK modulations
+    if debug_modulation is not None and (debug_modulation == 'GFSK' or debug_modulation == 'CPFSK'):
+        import json, time as _time
+        DEBUG_LOG_PATH = "/Users/Axer/Desktop/py-meanflow/.cursor/debug.log"
+        try:
+            with open(DEBUG_LOG_PATH, 'a') as f:
+                f.write(json.dumps({
+                    'location': 'evaluate_ood_denoising.py:estimate_snr', 'hypothesisId': 'G',
+                    'message': 'M2M4 estimator for FSK modulation',
+                    'data': {
+                        'modulation': debug_modulation,
+                        'm2_mean': m2.mean().item(), 'm4_mean': m4.mean().item(),
+                        's_term_mean': s_term.mean().item(), 'valid_ratio': valid_mask.float().mean().item(),
+                        'snr_db_mean': snr_db.mean().item(), 'snr_db_std': snr_db.std().item(),
+                    },
+                    'timestamp': int(_time.time()*1000), 'sessionId': 'debug-session'
+                }) + '\n')
+        except: pass
+    # #endregion
+    
     return snr_db
 
 
@@ -167,7 +188,9 @@ def compute_ood_score_min_error(
     model: MeanFlowDenoising,
     noisy_signal: torch.Tensor,
     clean_signal: torch.Tensor,
-    num_classes: int
+    num_classes: int,
+    modulation_names: Optional[List[str]] = None,
+    known_class_names: Optional[List[str]] = None
 ) -> torch.Tensor:
     """
     OOD score based on maximum output SNR across all known classes.
@@ -182,6 +205,8 @@ def compute_ood_score_min_error(
         noisy_signal: Noisy signal [batch, 2, 128]
         clean_signal: Clean signal [batch, 2, 128] (UNUSED - for compatibility only)
         num_classes: Number of known classes
+        modulation_names: Original modulation names for debugging
+        known_class_names: Known class names for debugging
     
     Returns:
         ood_scores: OOD scores [batch] (higher = more likely OOD)
@@ -189,7 +214,19 @@ def compute_ood_score_min_error(
     batch_size = noisy_signal.shape[0]
     device = noisy_signal.device
     
+    # #region agent log - Hypothesis F,G,H: Track per-class SNR estimates for GFSK/AM-SSB analysis
+    import json, time as _time
+    DEBUG_LOG_PATH = "/Users/Axer/Desktop/py-meanflow/.cursor/debug.log"
+    def _debug_log(data):
+        try:
+            with open(DEBUG_LOG_PATH, 'a') as f:
+                f.write(json.dumps({**data, 'timestamp': int(_time.time()*1000), 'sessionId': 'debug-session'}) + '\n')
+        except: pass
+    per_class_snrs = {}
+    # #endregion
+    
     max_snr = torch.full((batch_size,), float('-inf'), device=device)
+    best_class_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
     
     # Try denoising with each known class
     for class_id in range(num_classes):
@@ -208,8 +245,35 @@ def compute_ood_score_min_error(
         # Low SNR = poor quality = likely OOD
         snr = estimate_snr(denoised)
         
+        # #region agent log - Hypothesis F: Track per-class SNR for GFSK/CPFSK similarity analysis
+        class_name = known_class_names[class_id] if known_class_names else str(class_id)
+        per_class_snrs[class_name] = snr.mean().item()
+        # #endregion
+        
+        # Track which class gives best SNR
+        better_mask = snr > max_snr
+        best_class_idx[better_mask] = class_id
+        
         # Track maximum SNR across all classes
         max_snr = torch.maximum(max_snr, snr)
+    
+    # #region agent log - Hypothesis F,G: Log per-sample best class for GFSK analysis
+    if modulation_names is not None and known_class_names is not None:
+        # Sample a few entries for logging
+        for i in range(min(3, batch_size)):
+            mod_name = modulation_names[i] if i < len(modulation_names) else 'unknown'
+            best_class = known_class_names[best_class_idx[i].item()] if best_class_idx[i].item() < len(known_class_names) else str(best_class_idx[i].item())
+            _debug_log({
+                'location': 'evaluate_ood_denoising.py:compute_ood_score_min_error', 'hypothesisId': 'F_G',
+                'message': 'Per-sample OOD analysis',
+                'data': {
+                    'sample_idx': i, 'original_modulation': mod_name,
+                    'best_matching_class': best_class, 'best_snr': max_snr[i].item(),
+                    'per_class_snrs': per_class_snrs,
+                    'is_GFSK': mod_name == 'GFSK', 'is_AM_SSB': mod_name == 'AM-SSB',
+                }
+            })
+    # #endregion
     
     # OOD score: negative SNR (high SNR = low OOD score)
     ood_scores = -max_snr
@@ -553,7 +617,7 @@ def save_mdrc_visualization(
     logger.info(f'Saved visualization for {class_name} to {output_dir}')
 
 
-def extract_residual_features(input_sig: torch.Tensor, denoised_sig: torch.Tensor) -> np.ndarray:
+def extract_residual_features(input_sig: torch.Tensor, denoised_sig: torch.Tensor, debug_modulations: Optional[List[str]] = None) -> np.ndarray:
     """
     Extract multi-domain features from residual signal (input - denoised).
     
@@ -565,6 +629,7 @@ def extract_residual_features(input_sig: torch.Tensor, denoised_sig: torch.Tenso
     Args:
         input_sig: Input signal [batch, 2, length] (I/Q channels)
         denoised_sig: Denoised signal [batch, 2, length]
+        debug_modulations: Optional modulation names for debugging
         
     Returns:
         features: [batch, 3] feature vector
@@ -611,6 +676,29 @@ def extract_residual_features(input_sig: torch.Tensor, denoised_sig: torch.Tenso
     
     # Stack features
     features = np.stack([feat_amp, feat_phase, feat_spec], axis=1)  # [batch, 3]
+    
+    # #region agent log - Hypothesis H: Track residual feature distribution for GFSK vs AM-SSB
+    if debug_modulations is not None:
+        import json, time as _time
+        DEBUG_LOG_PATH = "/Users/Axer/Desktop/py-meanflow/.cursor/debug.log"
+        for i, mod in enumerate(debug_modulations[:5]):  # Log first 5 samples
+            if mod in ['GFSK', 'AM-SSB', 'CPFSK']:  # Focus on these modulations
+                try:
+                    with open(DEBUG_LOG_PATH, 'a') as f:
+                        f.write(json.dumps({
+                            'location': 'evaluate_ood_denoising.py:extract_residual_features', 'hypothesisId': 'H',
+                            'message': 'Residual features for OOD analysis',
+                            'data': {
+                                'modulation': mod, 'sample_idx': i,
+                                'feat_amp_kurtosis': float(feat_amp[i]),
+                                'feat_phase_kurtosis': float(feat_phase[i]),
+                                'feat_spec_sfm': float(feat_spec[i]),
+                                'residual_energy': float(np.mean(np.abs(residual_np[i])**2)),
+                            },
+                            'timestamp': int(_time.time()*1000), 'sessionId': 'debug-session'
+                        }) + '\n')
+                except: pass
+    # #endregion
     
     return features
 
@@ -855,7 +943,9 @@ def evaluate_ood_detection(
             # Compute OOD scores
             if method == 'min_error':
                 ood_scores = compute_ood_score_min_error(
-                    model, noisy_samples, clean_samples, model.num_classes
+                    model, noisy_samples, clean_samples, model.num_classes,
+                    modulation_names=list(info['original_modulation']),
+                    known_class_names=known_class_names
                 )
             elif method == 'avg_error':
                 ood_scores = compute_ood_score_avg_error(

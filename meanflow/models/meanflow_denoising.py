@@ -141,6 +141,21 @@ class MeanFlowDenoising(nn.Module):
         # Linear interpolation between clean (t=0) and noisy (t=1)
         z = (1 - t_reshaped) * x_clean + t_reshaped * x_noisy
         
+        # #region agent log - Hypothesis B,D: Check intermediate activations
+        import json, time as _time
+        DEBUG_LOG_PATH = "/Users/Axer/Desktop/py-meanflow/.cursor/debug.log"
+        def _debug_log(data):
+            try:
+                with open(DEBUG_LOG_PATH, 'a') as f:
+                    f.write(json.dumps({**data, 'timestamp': int(_time.time()*1000), 'sessionId': 'debug-session'}) + '\n')
+            except: pass
+        # Check z (interpolated input) stats
+        z_max = z.abs().max().item()
+        z_mean = z.abs().mean().item()
+        z_has_nan = torch.isnan(z).any().item()
+        z_has_inf = torch.isinf(z).any().item()
+        # #endregion
+        
         # Predict clean signal directly
         # We pass t for time embedding. 
         # Note: We now pass single t instead of (t, t) tuple as we simplify UNet interface
@@ -151,6 +166,30 @@ class MeanFlowDenoising(nn.Module):
             class_labels=class_labels,
             noisy_cond=None
         )
+        
+        # #region agent log - Hypothesis B,D: Check prediction stats
+        x_pred_max = x_pred.abs().max().item()
+        x_pred_mean = x_pred.abs().mean().item()
+        x_pred_has_nan = torch.isnan(x_pred).any().item()
+        x_pred_has_inf = torch.isinf(x_pred).any().item()
+        # Only log occasionally to avoid flooding
+        if hasattr(self, '_forward_count'):
+            self._forward_count += 1
+        else:
+            self._forward_count = 0
+        if self._forward_count < 10 or self._forward_count % 100 == 0:
+            _debug_log({
+                'location': 'meanflow_denoising.py:forward_with_loss', 'hypothesisId': 'B_D',
+                'message': 'Forward pass activation stats',
+                'data': {
+                    'forward_count': self._forward_count,
+                    'z_max': z_max, 'z_mean': z_mean, 'z_has_nan': z_has_nan, 'z_has_inf': z_has_inf,
+                    'x_pred_max': x_pred_max, 'x_pred_mean': x_pred_mean, 
+                    'x_pred_has_nan': x_pred_has_nan, 'x_pred_has_inf': x_pred_has_inf,
+                    'model_channels': self.net.model_channels,
+                }
+            })
+        # #endregion
         
         # Simple MSE loss on x prediction
         loss = F.mse_loss(x_pred, x_clean)

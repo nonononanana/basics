@@ -210,6 +210,10 @@ def parse_args():
     parser.add_argument('--use_edm_aug', action='store_true',
                        help='Use EDM augmentation')
     
+    # Masked Autoencoder arguments
+    parser.add_argument('--mask_ratio', type=float, default=0.0,
+                       help='Ratio of signal length to mask (0.0-1.0). Applied to both I/Q channels.')
+    
     args = parser.parse_args()
     return args
 
@@ -984,7 +988,8 @@ def main():
         normalize=args.normalize,
         seed=args.seed,
         precompute_negatives=False,
-        return_snr=True  # Enable SNR conditioning
+        return_snr=True,  # Enable SNR conditioning
+        mask_ratio=args.mask_ratio  # Apply masked autoencoder training
     )
     
     # Get actual SNR range from dataset

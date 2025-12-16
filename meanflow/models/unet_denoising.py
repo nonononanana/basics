@@ -242,6 +242,7 @@ class DenoisingUNet(nn.Module):
         
         # Add class embedding if provided
         if class_labels is not None:
+            class_emb = self.class_embed(class_labels)  
             class_emb = self.class_proj(class_emb)
             
             # Apply classifier-free guidance

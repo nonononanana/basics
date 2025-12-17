@@ -479,7 +479,7 @@ def compute_ood_score_correlation(
             denoised = model.denoise(
                 x_noisy=noisy_signal,
                 class_labels=class_labels,
-                num_steps=1
+                num_steps=20
             )
         
         # Calculate correlation

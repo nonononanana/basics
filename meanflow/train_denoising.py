@@ -285,13 +285,20 @@ def compute_denoising_metrics(
     snr_after = 10 * np.log10(signal_power / (noise_power_after + 1e-10))
     snr_improvement = snr_after - snr_before
     
-    # Correlation coefficient between predicted and true clean signals
-    # Flatten and compute correlation
-    # Per-sample correlation
+    # Correlation between predicted and true clean signals (per-sample, then averaged).
+    # We compute cosine similarity after zero-meaning each sample, which is equivalent to
+    # Pearson correlation on the flattened vectors.
     batch_size = x_clean_pred.shape[0]
-    pred_flat = x_clean_pred.reshape(batch_size, -1).detach().cpu().numpy()
-    true_flat = x_clean_true.reshape(batch_size, -1).detach().cpu().numpy()
-    correlation = np.corrcoef(pred_flat, true_flat)[0, 1]
+    pred_flat = x_clean_pred.reshape(batch_size, -1)
+    true_flat = x_clean_true.reshape(batch_size, -1)
+    pred_flat = pred_flat - pred_flat.mean(dim=1, keepdim=True)
+    true_flat = true_flat - true_flat.mean(dim=1, keepdim=True)
+    pred_norm = torch.norm(pred_flat, dim=1, keepdim=True).clamp_min(1e-8)
+    true_norm = torch.norm(true_flat, dim=1, keepdim=True).clamp_min(1e-8)
+    pred_unit = pred_flat / pred_norm
+    true_unit = true_flat / true_norm
+    corr_per_sample = (pred_unit * true_unit).sum(dim=1)  # [batch] in [-1, 1]
+    correlation = corr_per_sample.mean().item()
     
     # PSNR: Peak Signal-to-Noise Ratio
     max_val = max(x_clean_true.abs().max().item(), 1e-8)

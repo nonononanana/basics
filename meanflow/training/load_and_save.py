@@ -6,7 +6,7 @@
 from pathlib import Path
 
 import torch
-from training.distributed_mode import is_main_process
+from .distributed_mode import is_main_process
 
 import logging
 

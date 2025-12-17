@@ -5,9 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch.nn as nn
-from models.meanflow import MeanFlow
-
-from models.unet import SongUNet
+from .meanflow import MeanFlow
+from .unet import SongUNet
 
 MODEL_ARCHS = {
     "unet": SongUNet,

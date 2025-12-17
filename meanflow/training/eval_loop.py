@@ -17,8 +17,8 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchvision.utils import save_image
-from training import distributed_mode
-import models.rng as rng
+from . import distributed_mode
+from ..models import rng
 
 logger = logging.getLogger(__name__)
 

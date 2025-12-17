@@ -14,8 +14,8 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 from torchmetrics.aggregation import MeanMetric
 import torch.distributed as dist
-from models.augment import AugmentPipe
-import models.rng as rng
+from ..models.augment import AugmentPipe
+from ..models import rng
 from tqdm import tqdm
 
 

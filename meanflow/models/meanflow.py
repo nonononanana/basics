@@ -2,8 +2,8 @@ import torch
 
 import torch.nn as nn
 
-from models.time_sampler import sample_two_timesteps
-from models.ema import init_ema, update_ema_net
+from .time_sampler import sample_two_timesteps
+from .ema import init_ema, update_ema_net
 
 
 class MeanFlow(nn.Module):

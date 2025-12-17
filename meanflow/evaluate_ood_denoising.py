@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 from scipy.stats import kurtosis, gmean
+from scipy import signal as scipy_signal
 import matplotlib.pyplot as plt
 import matplotlib
 
@@ -29,6 +30,197 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+class AdvancedOODDetector:
+    """
+    Advanced OOD Detection using:
+    1. Signal Domain Residual Spectrum Analysis
+    2. Feature Domain Distance (Bottleneck Consistency)
+    """
+    
+    def __init__(self, model: MeanFlowDenoising):
+        """
+        Initialize the advanced OOD detector
+        
+        Args:
+            model: Trained denoising model
+        """
+        self.model = model
+        self.bottleneck_features = {}
+        self._register_hooks()
+    
+    def _register_hooks(self):
+        """Register forward hooks to extract bottleneck features"""
+        # The bottleneck is in the middle blocks of the UNet
+        # We'll extract features from the first middle block output
+        def hook_fn(name):
+            def hook(module, input, output):
+                self.bottleneck_features[name] = output.detach()
+            return hook
+        
+        # Register hook on the first middle block
+        if hasattr(self.model.net_ema, 'middle') and len(self.model.net_ema.middle) > 0:
+            self.model.net_ema.middle[0].register_forward_hook(hook_fn('bottleneck'))
+        elif hasattr(self.model.net, 'middle') and len(self.model.net.middle) > 0:
+            self.model.net.middle[0].register_forward_hook(hook_fn('bottleneck'))
+        else:
+            logger.warning("Could not find middle blocks for hook registration")
+    
+    def compute_spectral_flatness(self, signal: torch.Tensor) -> torch.Tensor:
+        """
+        Compute spectral flatness (Wiener entropy) of a signal.
+        
+        Spectral flatness = geometric_mean(PSD) / arithmetic_mean(PSD)
+        
+        Low flatness (~0) indicates structural/tonal content (likely OOD residual)
+        High flatness (~1) indicates white noise (likely ID residual)
+        
+        Args:
+            signal: Complex signal [batch, length]
+            
+        Returns:
+            Spectral flatness values [batch]
+        """
+        batch_size = signal.shape[0]
+        signal_np = signal.cpu().numpy()
+        
+        flatness_values = []
+        
+        for i in range(batch_size):
+            # Compute Power Spectral Density using Welch's method
+            # This is more robust than raw FFT for noisy signals
+            freqs, psd = scipy_signal.welch(
+                signal_np[i],
+                fs=1.0,  # Normalized frequency
+                nperseg=min(64, len(signal_np[i])),
+                scaling='density'
+            )
+            
+            # Add small epsilon to avoid log(0)
+            psd = psd + 1e-12
+            
+            # Spectral flatness = exp(mean(log(PSD))) / mean(PSD)
+            # = geometric_mean / arithmetic_mean
+            geometric_mean = np.exp(np.mean(np.log(psd)))
+            arithmetic_mean = np.mean(psd)
+            
+            flatness = geometric_mean / arithmetic_mean
+            flatness_values.append(flatness)
+        
+        return torch.tensor(flatness_values, dtype=torch.float32)
+    
+    def compute_residual_spectrum_score(
+        self,
+        noisy_input: torch.Tensor,
+        reconstructed_output: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Method A: Signal Domain Residual Spectrum Analysis
+        
+        Computes OOD score based on spectral characteristics of the residual.
+        For ID data, residual should be white noise (high spectral flatness).
+        For OOD data, residual contains structural artifacts (low spectral flatness).
+        
+        Args:
+            noisy_input: Noisy/masked input signal [batch, 2, length]
+            reconstructed_output: Reconstructed clean output [batch, 2, length]
+            
+        Returns:
+            OOD scores [batch] (higher = more likely OOD)
+        """
+        # Compute residual
+        residual = noisy_input - reconstructed_output  # [batch, 2, length]
+        
+        # Convert I/Q to complex signal
+        residual_complex = residual[:, 0, :] + 1j * residual[:, 1, :]  # [batch, length]
+        
+        # Compute spectral flatness
+        spectral_flatness = self.compute_spectral_flatness(residual_complex)  # [batch]
+        
+        # OOD score: negative log of spectral flatness
+        # High flatness (white noise, ID) -> low score
+        # Low flatness (structural, OOD) -> high score
+        ood_scores = -torch.log(spectral_flatness + 1e-10)
+        
+        return ood_scores
+    
+    def extract_bottleneck_features(
+        self,
+        signal: torch.Tensor,
+        class_labels: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Extract bottleneck features from a signal by passing it through the encoder.
+        
+        Args:
+            signal: Input signal [batch, 2, length]
+            class_labels: Class labels for conditional denoising [batch]
+            
+        Returns:
+            Bottleneck features [batch, channels, bottleneck_length]
+        """
+        # Clear previous features
+        self.bottleneck_features = {}
+        
+        # Forward pass through the model (this triggers the hook)
+        with torch.no_grad():
+            _ = self.model.denoise(
+                x_noisy=signal,
+                class_labels=class_labels,
+                num_steps=1
+            )
+        
+        # Extract the bottleneck features
+        if 'bottleneck' in self.bottleneck_features:
+            return self.bottleneck_features['bottleneck']
+        else:
+            raise RuntimeError("Bottleneck features were not captured by the hook")
+    
+    def compute_feature_domain_distance(
+        self,
+        noisy_input: torch.Tensor,
+        reconstructed_output: torch.Tensor,
+        class_labels: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Method B: Feature Domain Distance (Bottleneck Consistency)
+        
+        Compares the deep feature representations of input and output.
+        If the model hallucinates (OOD), the features will be very different.
+        If the model correctly denoises (ID), the features will be similar.
+        
+        Args:
+            noisy_input: Noisy/masked input signal [batch, 2, length]
+            reconstructed_output: Reconstructed clean output [batch, 2, length]
+            class_labels: Class labels used for denoising [batch]
+            
+        Returns:
+            OOD scores [batch] (higher = more likely OOD)
+        """
+        # Extract features from input
+        features_input = self.extract_bottleneck_features(noisy_input, class_labels)
+        
+        # Extract features from output
+        features_output = self.extract_bottleneck_features(reconstructed_output, class_labels)
+        
+        # Flatten features for cosine similarity computation
+        batch_size = features_input.shape[0]
+        feat_in_flat = features_input.view(batch_size, -1)
+        feat_out_flat = features_output.view(batch_size, -1)
+        
+        # Normalize features
+        feat_in_norm = F.normalize(feat_in_flat, p=2, dim=1)
+        feat_out_norm = F.normalize(feat_out_flat, p=2, dim=1)
+        
+        # Compute cosine similarity
+        cosine_similarity = (feat_in_norm * feat_out_norm).sum(dim=1)  # [batch]
+        
+        # Cosine distance = 1 - cosine_similarity
+        # Higher distance = more different = more likely OOD
+        cosine_distance = 1.0 - cosine_similarity
+        
+        return cosine_distance
 
 
 def parse_args():
@@ -45,7 +237,8 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4,
                        help='Number of data loading workers')
     parser.add_argument('--method', type=str, default='min_error', 
-                       choices=['min_error', 'avg_error', 'improvement', 'snr_improvement', 'correlation', 'mdrc'],
+                       choices=['min_error', 'avg_error', 'improvement', 'snr_improvement', 'correlation', 'mdrc', 
+                                'residual_spectrum', 'feature_distance'],
                        help='OOD scoring method')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                        help='Device to use')
@@ -894,6 +1087,109 @@ def compute_ood_score_mdrc(
     return min_distances
 
 
+def compute_ood_score_residual_spectrum(
+    model: MeanFlowDenoising,
+    noisy_signal: torch.Tensor,
+    clean_signal: torch.Tensor,
+    num_classes: int,
+    ood_detector: AdvancedOODDetector
+) -> torch.Tensor:
+    """
+    Method A: Signal Domain Residual Spectrum Analysis
+    
+    OOD score based on spectral flatness of the residual signal.
+    For ID data, residual should be white noise (high flatness).
+    For OOD data, residual contains structural artifacts (low flatness).
+    
+    Args:
+        model: Trained denoising model
+        noisy_signal: Noisy signal [batch, 2, 128]
+        clean_signal: Clean signal [batch, 2, 128] (UNUSED - for compatibility only)
+        num_classes: Number of known classes
+        ood_detector: AdvancedOODDetector instance
+    
+    Returns:
+        ood_scores: OOD scores [batch] (higher = more likely OOD)
+    """
+    batch_size = noisy_signal.shape[0]
+    device = noisy_signal.device
+    
+    # Try denoising with all known classes and take minimum score
+    min_scores = torch.full((batch_size,), float('inf'), device=device)
+    
+    for class_id in range(num_classes):
+        class_labels = torch.full((batch_size,), class_id, dtype=torch.long, device=device)
+        
+        # Denoise
+        with torch.no_grad():
+            denoised = model.denoise(
+                x_noisy=noisy_signal,
+                class_labels=class_labels,
+                num_steps=1
+            )
+        
+        # Compute spectral flatness-based OOD score
+        scores = ood_detector.compute_residual_spectrum_score(noisy_signal, denoised)
+        scores = scores.to(device)
+        
+        # Take minimum across all classes (best case)
+        min_scores = torch.minimum(min_scores, scores)
+    
+    return min_scores
+
+
+def compute_ood_score_feature_distance(
+    model: MeanFlowDenoising,
+    noisy_signal: torch.Tensor,
+    clean_signal: torch.Tensor,
+    num_classes: int,
+    ood_detector: AdvancedOODDetector
+) -> torch.Tensor:
+    """
+    Method B: Feature Domain Distance (Bottleneck Consistency)
+    
+    OOD score based on cosine distance between bottleneck features
+    of input and output. Larger distance indicates the model produced
+    a semantically different output (hallucination), likely OOD.
+    
+    Args:
+        model: Trained denoising model
+        noisy_signal: Noisy signal [batch, 2, 128]
+        clean_signal: Clean signal [batch, 2, 128] (UNUSED - for compatibility only)
+        num_classes: Number of known classes
+        ood_detector: AdvancedOODDetector instance
+    
+    Returns:
+        ood_scores: OOD scores [batch] (higher = more likely OOD)
+    """
+    batch_size = noisy_signal.shape[0]
+    device = noisy_signal.device
+    
+    # Try denoising with all known classes and take minimum distance
+    min_distances = torch.full((batch_size,), float('inf'), device=device)
+    
+    for class_id in range(num_classes):
+        class_labels = torch.full((batch_size,), class_id, dtype=torch.long, device=device)
+        
+        # Denoise
+        with torch.no_grad():
+            denoised = model.denoise(
+                x_noisy=noisy_signal,
+                class_labels=class_labels,
+                num_steps=1
+            )
+        
+        # Compute feature domain distance
+        distances = ood_detector.compute_feature_domain_distance(
+            noisy_signal, denoised, class_labels
+        )
+        
+        # Take minimum across all classes (best case)
+        min_distances = torch.minimum(min_distances, distances)
+    
+    return min_distances
+
+
 def evaluate_ood_detection(
     model: MeanFlowDenoising,
     test_loader: DataLoader,
@@ -931,6 +1227,12 @@ def evaluate_ood_detection(
     
     # Flag to save visualization only once (first batch)
     visualization_saved = False
+    
+    # Initialize AdvancedOODDetector for new methods
+    ood_detector = None
+    if method in ['residual_spectrum', 'feature_distance']:
+        logger.info('Initializing AdvancedOODDetector...')
+        ood_detector = AdvancedOODDetector(model)
     
     # Collect OOD scores
     logger.info(f'Computing OOD scores using method: {method}')
@@ -975,6 +1277,18 @@ def evaluate_ood_detection(
                 )
                 if should_visualize:
                     visualization_saved = True
+            elif method == 'residual_spectrum':
+                if ood_detector is None:
+                    raise ValueError('residual_spectrum method requires AdvancedOODDetector')
+                ood_scores = compute_ood_score_residual_spectrum(
+                    model, noisy_samples, clean_samples, model.num_classes, ood_detector
+                )
+            elif method == 'feature_distance':
+                if ood_detector is None:
+                    raise ValueError('feature_distance method requires AdvancedOODDetector')
+                ood_scores = compute_ood_score_feature_distance(
+                    model, noisy_samples, clean_samples, model.num_classes, ood_detector
+                )
             else:
                 raise ValueError(f'Unknown method: {method}')
             

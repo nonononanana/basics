@@ -68,7 +68,7 @@ class AdvancedOODDetector:
     
     def compute_spectral_flatness(self, signal: torch.Tensor) -> torch.Tensor:
         """
-        Compute spectral flatness (Wiener entropy) of a signal.
+        Compute spectral flatness (Wiener entropy) of a signal using batch processing.
         
         Spectral flatness = geometric_mean(PSD) / arithmetic_mean(PSD)
         
@@ -81,31 +81,74 @@ class AdvancedOODDetector:
         Returns:
             Spectral flatness values [batch]
         """
-        batch_size = signal.shape[0]
-        signal_np = signal.cpu().numpy()
+        # Ensure signal is on the correct device
+        device = signal.device
+        batch_size, signal_length = signal.shape
         
-        flatness_values = []
+        # Use Welch's method parameters
+        nperseg = min(64, signal_length)
+        noverlap = nperseg // 2
         
-        for i in range(batch_size):
-            # Compute Power Spectral Density using Welch's method
-            freqs, psd = scipy_signal.welch(
-                signal_np[i],
-                fs=1.0,  # Normalized frequency
-                nperseg=min(64, len(signal_np[i])),
-                scaling='density'
-            )
-            
-            # Add small epsilon to avoid log(0)
-            psd = psd + 1e-12
-            
-            # Spectral flatness = exp(mean(log(PSD))) / mean(PSD)
-            geometric_mean = np.exp(np.mean(np.log(psd)))
-            arithmetic_mean = np.mean(psd)
-            
-            flatness = geometric_mean / arithmetic_mean
-            flatness_values.append(flatness)
+        # Calculate number of segments
+        step = nperseg - noverlap
+        num_segments = (signal_length - noverlap) // step
         
-        return torch.tensor(flatness_values, dtype=torch.float32)
+        if num_segments < 1:
+            # Fallback: use simple FFT if signal too short
+            fft_result = torch.fft.fft(signal, dim=1)
+            psd = torch.abs(fft_result) ** 2
+            psd = psd[:, :signal_length // 2]  # Keep only positive frequencies
+        else:
+            # Implement Welch's method with batch processing
+            # Create Hann window
+            window = torch.hann_window(nperseg, device=device)
+            
+            # Storage for PSD segments
+            psd_segments = []
+            
+            for i in range(num_segments):
+                start_idx = i * step
+                end_idx = start_idx + nperseg
+                
+                if end_idx > signal_length:
+                    break
+                
+                # Extract segment for all batch samples
+                segment = signal[:, start_idx:end_idx]  # [batch, nperseg]
+                
+                # Apply window
+                windowed = segment * window.unsqueeze(0)  # [batch, nperseg]
+                
+                # Compute FFT
+                fft_result = torch.fft.fft(windowed, dim=1)  # [batch, nperseg]
+                
+                # Compute power spectral density
+                segment_psd = torch.abs(fft_result) ** 2  # [batch, nperseg]
+                
+                psd_segments.append(segment_psd)
+            
+            # Average across segments
+            psd = torch.stack(psd_segments, dim=0).mean(dim=0)  # [batch, nperseg]
+            
+            # Normalize by window power
+            window_power = (window ** 2).sum()
+            psd = psd / window_power
+            
+            # Keep only positive frequencies (first half)
+            psd = psd[:, :nperseg // 2]
+        
+        # Add small epsilon to avoid log(0) and division by zero
+        psd = psd + 1e-12
+        
+        # Spectral flatness = exp(mean(log(PSD))) / mean(PSD)
+        # Geometric mean = exp(mean(log(x)))
+        log_psd = torch.log(psd)
+        geometric_mean = torch.exp(log_psd.mean(dim=1))  # [batch]
+        arithmetic_mean = psd.mean(dim=1)  # [batch]
+        
+        flatness = geometric_mean / arithmetic_mean  # [batch]
+        
+        return flatness
     
     def compute_residual_spectrum_score(
         self,

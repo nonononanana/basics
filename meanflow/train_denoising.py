@@ -31,6 +31,7 @@ from meanflow.data.rml_dataset import get_rml_denoising_dataloaders, RML2016Deno
 from meanflow.models.meanflow_denoising import MeanFlowDenoising
 from meanflow.models.unet_denoising import DenoisingUNet
 from meanflow.training import distributed_mode
+from meanflow.evaluate_ood_advanced import AdvancedOODDetector
 
 # Setup logging
 logging.basicConfig(
@@ -488,6 +489,7 @@ def evaluate(
 ) -> Dict[str, float]:
     """
     Evaluate model on test set with denoising metrics
+    Separates ID (in-distribution) and OOD (out-of-distribution) evaluation
     
     Args:
         model: Mean Flow denoising model
@@ -500,12 +502,18 @@ def evaluate(
     """
     model.eval()
     
-    # Storage for metrics
+    # Storage for overall metrics
     all_mse = []
     all_nmse = []
     all_snr_improvement = []
     all_correlation = []
     all_psnr = []
+    
+    # Separate storage for ID and OOD metrics
+    id_mse = []  # Min MSE for ID samples
+    ood_mse = []  # Min MSE for OOD samples
+    id_mse_avg = []  # Average MSE across all classes for ID samples
+    ood_mse_avg = []  # Average MSE across all classes for OOD samples
     
     # Per-SNR metrics
     snr_metrics = {}
@@ -521,6 +529,9 @@ def evaluate(
         ncols=80
     )
     
+    # Initialize OOD detector for residual spectrum analysis
+    ood_detector = AdvancedOODDetector(model)
+    
     # Store data for OOD evaluation
     ood_labels = [] # 0=known, 1=unknown
     
@@ -528,6 +539,11 @@ def evaluate(
     ood_min_errors = [] # MSE
     ood_max_corrs = [] # Correlation
     ood_max_snr_imps = [] # Blind SNR Improvement
+    
+    # Store residual spectrum scores (for all samples, ID and OOD separately)
+    id_residual_spectrum_scores = []
+    ood_residual_spectrum_scores = []
+    all_residual_spectrum_scores = []
 
     with torch.no_grad():
         for noisy_samples, clean_samples, labels, info in eval_progress:
@@ -542,6 +558,9 @@ def evaluate(
             batch_min_errors = torch.full((batch_size,), float('inf'), device=args.device)
             batch_max_corrs = torch.full((batch_size,), -1.0, device=args.device)
             batch_max_snr_imps = torch.full((batch_size,), float('-inf'), device=args.device)
+            
+            # Initialize average MSE accumulator
+            batch_sum_errors = torch.zeros((batch_size,), device=args.device)
             
             # Store best denoised result for each sample
             best_denoised = torch.zeros_like(noisy_samples)
@@ -572,6 +591,9 @@ def evaluate(
                 errors = F.mse_loss(denoised_hypothesis, clean_samples, reduction='none')
                 errors = errors.mean(dim=(1, 2)) # [batch]
                 
+                # Accumulate errors for average MSE calculation
+                batch_sum_errors += errors
+                
                 # Update best denoised result when we find lower error
                 better_mask = errors < batch_min_errors
                 best_denoised[better_mask] = denoised_hypothesis[better_mask]
@@ -590,9 +612,22 @@ def evaluate(
                 imps = snr_out - snr_in
                 batch_max_snr_imps = torch.maximum(batch_max_snr_imps, imps)
             
+            # Calculate average MSE across all known classes
+            batch_avg_errors = batch_sum_errors / model.num_classes
+            
+            # Compute residual spectrum scores for all samples
+            residual_spectrum_scores = ood_detector.compute_residual_spectrum_score(
+                noisy_input=noisy_samples,
+                reconstructed_output=best_denoised
+            )
+            
+            # Store residual spectrum scores
+            all_residual_spectrum_scores.extend(residual_spectrum_scores.cpu().numpy())
+            
             # Store OOD Scores and Labels
             # Ground truth: 1 if OOD (label == -1), 0 if ID
             is_ood = (labels == -1).cpu().numpy().astype(int)
+            is_id = (labels != -1).cpu().numpy().astype(bool)
             ood_labels.extend(is_ood)
             
             # OOD Scores:
@@ -617,6 +652,21 @@ def evaluate(
             all_snr_improvement.append(batch_metrics['snr_improvement'])
             all_correlation.append(batch_metrics['correlation'])
             all_psnr.append(batch_metrics['psnr'])
+            
+            # Separate ID and OOD MSE (min MSE - best hypothesis)
+            batch_mse_per_sample = F.mse_loss(best_denoised, clean_samples, reduction='none').mean(dim=(1, 2)).cpu().numpy()
+            id_mse.extend(batch_mse_per_sample[is_id])
+            ood_mse.extend(batch_mse_per_sample[~is_id])
+            
+            # Separate ID and OOD average MSE (average across all known classes)
+            batch_avg_errors_np = batch_avg_errors.cpu().numpy()
+            id_mse_avg.extend(batch_avg_errors_np[is_id])
+            ood_mse_avg.extend(batch_avg_errors_np[~is_id])
+            
+            # Separate residual spectrum scores by ID/OOD
+            residual_spectrum_np = residual_spectrum_scores.cpu().numpy()
+            id_residual_spectrum_scores.extend(residual_spectrum_np[is_id])
+            ood_residual_spectrum_scores.extend(residual_spectrum_np[~is_id])
             
             # Per-sample metrics for SNR and modulation breakdown
             snr_values = info['snr'].numpy()
@@ -657,7 +707,6 @@ def evaluate(
             if len(np.unique(ood_labels_arr)) > 1:
                 return {
                     f'eval/ood_{name}_auroc': roc_auc_score(ood_labels_arr, scores),
-                    # f'eval/ood_{name}_aupr': average_precision_score(ood_labels_arr, scores)
                 }
         except Exception as e:
             logger.warning(f"Could not calculate OOD metrics for {name}: {e}")
@@ -666,6 +715,12 @@ def evaluate(
     mse_metrics = calc_ood_metrics(np.array(ood_min_errors), 'mse')
     corr_metrics = calc_ood_metrics(np.array(ood_max_corrs), 'corr')
     snr_metrics_ood = calc_ood_metrics(np.array(ood_max_snr_imps), 'snr')
+    
+    # Calculate AUROC for residual spectrum scores
+    residual_spectrum_auroc_metrics = calc_ood_metrics(
+        np.array(all_residual_spectrum_scores), 
+        'residual_spectrum'
+    )
 
     # Compile overall metrics
     metrics = {
@@ -676,8 +731,19 @@ def evaluate(
         'eval/psnr': np.mean(all_psnr),
         **mse_metrics,
         **corr_metrics,
-        **snr_metrics_ood
+        **snr_metrics_ood,
+        **residual_spectrum_auroc_metrics
     }
+    
+    # Add separate ID and OOD metrics
+    if len(id_mse) > 0:
+        metrics['eval/id_mse_min'] = np.mean(id_mse)  # Min MSE (best hypothesis)
+        metrics['eval/id_mse_avg'] = np.mean(id_mse_avg)  # Average MSE across all classes
+        metrics['eval/id_residual_spectrum'] = np.mean(id_residual_spectrum_scores) if len(id_residual_spectrum_scores) > 0 else 0.0
+    if len(ood_mse) > 0:
+        metrics['eval/ood_mse_min'] = np.mean(ood_mse)  # Min MSE (best hypothesis)
+        metrics['eval/ood_mse_avg'] = np.mean(ood_mse_avg)  # Average MSE across all classes
+        metrics['eval/ood_residual_spectrum'] = np.mean(ood_residual_spectrum_scores) if len(ood_residual_spectrum_scores) > 0 else 0.0
     
     # Add per-SNR metrics
     for snr, snr_data in sorted(snr_metrics.items()):
@@ -692,19 +758,41 @@ def evaluate(
         metrics[f'eval/mod_{mod}/correlation'] = np.mean(mod_data['corr'])
     
     # Log summary
-    logger.info(f'\nDenoising Evaluation Results (Best Hypothesis):')
+    logger.info(f'\n{"="*70}')
+    logger.info(f'Denoising Evaluation Results (Epoch {epoch})')
+    logger.info(f'{"="*70}')
+    logger.info(f'\nOverall Metrics (Best Hypothesis):')
     logger.info(f'  Overall MSE: {metrics["eval/mse"]:.6f}')
     logger.info(f'  Overall NMSE: {metrics["eval/nmse"]:.6f}')
     logger.info(f'  SNR Improvement: {metrics["eval/snr_improvement"]:.2f} dB')
     logger.info(f'  Correlation: {metrics["eval/correlation"]:.4f}')
     logger.info(f'  PSNR: {metrics["eval/psnr"]:.2f} dB')
     
+    # Log ID vs OOD metrics
+    logger.info(f'\nID vs OOD Metrics:')
+    if 'eval/id_mse_min' in metrics:
+        logger.info(f'  ID MSE (min): {metrics["eval/id_mse_min"]:.6f}')
+        logger.info(f'  ID MSE (avg): {metrics["eval/id_mse_avg"]:.6f}')
+        logger.info(f'  ID Residual Spectrum: {metrics["eval/id_residual_spectrum"]:.4f}')
+    if 'eval/ood_mse_min' in metrics:
+        logger.info(f'  OOD MSE (min): {metrics["eval/ood_mse_min"]:.6f}')
+        logger.info(f'  OOD MSE (avg): {metrics["eval/ood_mse_avg"]:.6f}')
+        logger.info(f'  OOD Residual Spectrum: {metrics["eval/ood_residual_spectrum"]:.4f}')
+    
+    # Log AUROC metrics
+    logger.info(f'\nOOD Detection Performance (AUROC):')
+    logger.info(f'  MSE-based AUROC: {metrics.get("eval/ood_mse_auroc", 0.5):.4f}')
+    logger.info(f'  Correlation-based AUROC: {metrics.get("eval/ood_corr_auroc", 0.5):.4f}')
+    logger.info(f'  SNR Improvement AUROC: {metrics.get("eval/ood_snr_auroc", 0.5):.4f}')
+    logger.info(f'  Residual Spectrum AUROC: {metrics.get("eval/ood_residual_spectrum_auroc", 0.5):.4f}')
+    
     # Log per-SNR summary
-    logger.info('\nPer-SNR Results:')
+    logger.info(f'\nPer-SNR Results:')
     for snr in sorted(snr_metrics.keys()):
         logger.info(f'  SNR {snr:3d} dB: MSE={np.mean(snr_metrics[snr]["mse"]):.6f}, '
                    f'Imp={np.mean(snr_metrics[snr]["snr_imp"]):.2f} dB, '
                    f'Corr={np.mean(snr_metrics[snr]["corr"]):.4f}')
+    logger.info(f'{"="*70}\n')
     
     return metrics
 

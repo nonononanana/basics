@@ -281,7 +281,13 @@ def create_summary_plot(
     if num_samples == 1:
         axes = axes.reshape(1, -1)
     
-    fig.suptitle('Denoising and Reconstruction Summary (I Channel)', fontsize=16, fontweight='bold')
+    # Count ID and OOD samples
+    num_id = sum(1 for s in samples_data if not s.get('is_ood', False))
+    num_ood = sum(1 for s in samples_data if s.get('is_ood', False))
+    
+    fig.suptitle(f'Denoising and Reconstruction Summary (I Channel)\n'
+                 f'ID Samples: {num_id} (black) | OOD Samples: {num_ood} (red)', 
+                 fontsize=16, fontweight='bold')
     
     time_steps = np.arange(128)
     
@@ -293,12 +299,18 @@ def create_summary_plot(
         mask_end = sample['mask_end']
         modulation = sample['modulation']
         snr = sample['snr']
+        is_ood = sample.get('is_ood', False)
+        
+        # Choose color based on ID/OOD status
+        label_color = 'red' if is_ood else 'black'
+        sample_type = 'OOD' if is_ood else 'ID'
         
         # Column 1: Noisy
         axes[idx, 0].plot(time_steps, noisy[0, :], 'b-', linewidth=1.0)
         if mask_start >= 0 and mask_end >= 0:
             axes[idx, 0].axvspan(mask_start, mask_end, alpha=0.3, color='red')
-        axes[idx, 0].set_ylabel(f'{modulation}\nSNR={snr:.0f}dB', fontsize=9)
+        axes[idx, 0].set_ylabel(f'[{sample_type}] {modulation}\nSNR={snr:.0f}dB', 
+                                fontsize=9, color=label_color, fontweight='bold' if is_ood else 'normal')
         axes[idx, 0].grid(True, alpha=0.3)
         if idx == 0:
             axes[idx, 0].set_title('Noisy Input (masked)', fontsize=11, fontweight='bold')
@@ -362,17 +374,15 @@ def main():
         mask_ratio=args.mask_ratio
     )
     
-    print(f"\nCollecting {args.num_samples} samples from validation set...")
+    print(f"\nCollecting samples from validation set...")
+    print("Step 1: Gathering all available samples (ID and OOD)...")
     
-    # Collect samples
-    samples_data = []
-    collected = 0
+    # First pass: collect ID and OOD samples separately
+    id_samples = []
+    ood_samples = []
     
     with torch.no_grad():
         for noisy_samples, clean_samples, labels, info in val_loader:
-            if collected >= args.num_samples:
-                break
-            
             # Move to device
             noisy_samples = noisy_samples.to(args.device)
             clean_samples = clean_samples.to(args.device)
@@ -381,76 +391,220 @@ def main():
             batch_size = noisy_samples.shape[0]
             
             for i in range(batch_size):
-                if collected >= args.num_samples:
-                    break
+                sample_dict = {
+                    'noisy': noisy_samples[i:i+1],
+                    'clean': clean_samples[i:i+1],
+                    'label': labels[i:i+1],
+                    'modulation': info['original_modulation'][i],
+                    'snr': info['snr'][i].item(),
+                    'is_ood': labels[i].item() == -1
+                }
                 
-                # Get single sample
-                noisy = noisy_samples[i:i+1]
-                clean = clean_samples[i:i+1]
-                label = labels[i:i+1]
-                modulation = info['original_modulation'][i]
-                snr = info['snr'][i].item()
+                # Separate ID and OOD samples
+                if labels[i].item() == -1:
+                    ood_samples.append(sample_dict)
+                else:
+                    id_samples.append(sample_dict)
+    
+    print(f"Found {len(id_samples)} ID samples and {len(ood_samples)} OOD samples in validation set")
+    
+    # Step 2: Randomly select samples from both ID and OOD
+    num_id_to_select = min(args.num_samples, len(id_samples))
+    num_ood_to_select = min(args.num_samples, len(ood_samples))
+    
+    print(f"\nStep 2: Randomly selecting samples...")
+    print(f"  ID samples to select: {num_id_to_select}")
+    print(f"  OOD samples to select: {num_ood_to_select}")
+    
+    selected_samples = []
+    
+    # Select ID samples
+    if num_id_to_select > 0:
+        id_indices = np.random.choice(len(id_samples), size=num_id_to_select, replace=False)
+        selected_samples.extend([id_samples[i] for i in id_indices])
+    else:
+        print("  WARNING: No ID samples available!")
+    
+    # Select OOD samples
+    if num_ood_to_select > 0:
+        ood_indices = np.random.choice(len(ood_samples), size=num_ood_to_select, replace=False)
+        selected_samples.extend([ood_samples[i] for i in ood_indices])
+    else:
+        print("  WARNING: No OOD samples available!")
+    
+    if len(selected_samples) == 0:
+        print("ERROR: No samples available for visualization!")
+        return
+    
+    # Print diversity statistics
+    print(f"\nSelected sample diversity (Total: {len(selected_samples)}):")
+    
+    # ID samples statistics
+    id_selected = [s for s in selected_samples if not s['is_ood']]
+    if len(id_selected) > 0:
+        print(f"\n  ID Samples ({len(id_selected)}):")
+        id_mod_counts = {}
+        id_snr_ranges = {'low': 0, 'mid': 0, 'high': 0}
+        for sample in id_selected:
+            mod = sample['modulation']
+            snr = sample['snr']
+            id_mod_counts[mod] = id_mod_counts.get(mod, 0) + 1
+            if snr < -5:
+                id_snr_ranges['low'] += 1
+            elif snr < 10:
+                id_snr_ranges['mid'] += 1
+            else:
+                id_snr_ranges['high'] += 1
+        
+        print(f"    Modulation types: {len(id_mod_counts)}")
+        for mod, count in sorted(id_mod_counts.items()):
+            print(f"      {mod}: {count}")
+        print(f"    SNR distribution:")
+        print(f"      Low SNR (<-5dB): {id_snr_ranges['low']}")
+        print(f"      Mid SNR (-5 to 10dB): {id_snr_ranges['mid']}")
+        print(f"      High SNR (>10dB): {id_snr_ranges['high']}")
+    
+    # OOD samples statistics
+    ood_selected = [s for s in selected_samples if s['is_ood']]
+    if len(ood_selected) > 0:
+        print(f"\n  OOD Samples ({len(ood_selected)}):")
+        ood_mod_counts = {}
+        ood_snr_ranges = {'low': 0, 'mid': 0, 'high': 0}
+        for sample in ood_selected:
+            mod = sample['modulation']
+            snr = sample['snr']
+            ood_mod_counts[mod] = ood_mod_counts.get(mod, 0) + 1
+            if snr < -5:
+                ood_snr_ranges['low'] += 1
+            elif snr < 10:
+                ood_snr_ranges['mid'] += 1
+            else:
+                ood_snr_ranges['high'] += 1
+        
+        print(f"    Modulation types: {len(ood_mod_counts)}")
+        for mod, count in sorted(ood_mod_counts.items()):
+            print(f"      {mod}: {count}")
+        print(f"    SNR distribution:")
+        print(f"      Low SNR (<-5dB): {ood_snr_ranges['low']}")
+        print(f"      Mid SNR (-5 to 10dB): {ood_snr_ranges['mid']}")
+        print(f"      High SNR (>10dB): {ood_snr_ranges['high']}")
+    
+    # Step 3: Process and visualize selected samples
+    total_samples = len(selected_samples)
+    print(f"\nStep 3: Processing and visualizing {total_samples} samples...")
+    samples_data = []
+    
+    with torch.no_grad():
+        for idx, sample in enumerate(selected_samples):
+            noisy = sample['noisy']
+            clean = sample['clean']
+            label = sample['label']
+            modulation = sample['modulation']
+            snr = sample['snr']
+            is_ood = sample['is_ood']
+            
+            # For OOD samples, try all known classes and pick best reconstruction
+            # For ID samples, use the true class label
+            if is_ood:
+                # Try all known classes and find the one with minimum reconstruction error
+                best_denoised = None
+                min_error = float('inf')
+                best_class_id = -1
                 
-                # Skip OOD samples (label == -1) for cleaner visualization
-                if label.item() == -1:
-                    continue
+                for class_id in range(model.num_classes):
+                    hypothesis_label = torch.full_like(label, class_id)
+                    denoised_hypothesis = model.denoise(
+                        x_noisy=noisy,
+                        class_labels=hypothesis_label,
+                        num_steps=1
+                    )
+                    
+                    # Compute reconstruction error (blind metric: correlation with noisy input)
+                    # Higher correlation = better match to expected clean signal
+                    noisy_flat = noisy.view(1, -1)
+                    denoised_flat = denoised_hypothesis.view(1, -1)
+                    # Normalize
+                    noisy_norm = noisy_flat - noisy_flat.mean()
+                    denoised_norm = denoised_flat - denoised_flat.mean()
+                    correlation = torch.cosine_similarity(noisy_norm, denoised_norm, dim=1).item()
+                    
+                    # Higher correlation is better, so use negative for minimization
+                    error = -correlation
+                    
+                    if error < min_error:
+                        min_error = error
+                        best_denoised = denoised_hypothesis
+                        best_class_id = class_id
                 
-                # Denoise using the true class label
+                denoised = best_denoised
+                ood_label = f"OOD(best:{best_class_id})"
+            else:
+                # ID sample: use true class label
                 denoised = model.denoise(
                     x_noisy=noisy,
                     class_labels=label,
                     num_steps=1
                 )
-                
-                # Convert to numpy
-                noisy_np = noisy.cpu().numpy()[0]  # [2, 128]
-                clean_np = clean.cpu().numpy()[0]  # [2, 128]
-                denoised_np = denoised.cpu().numpy()[0]  # [2, 128]
-                
-                # Find masked region
-                mask_start, mask_end = find_mask_region(noisy_np, args.mask_ratio)
-                
-                # Store sample data
-                samples_data.append({
-                    'idx': collected,
-                    'noisy': noisy_np,
-                    'clean': clean_np,
-                    'denoised': denoised_np,
-                    'mask_start': mask_start,
-                    'mask_end': mask_end,
-                    'modulation': modulation,
-                    'snr': snr,
-                    'label': label.item()
-                })
-                
-                # Visualize individual sample
-                output_path = Path(args.output_dir) / f'sample_{collected:02d}_{modulation}_snr{snr:.0f}.png'
-                visualize_sample(
-                    idx=collected,
-                    noisy_signal=noisy_np,
-                    clean_signal=clean_np,
-                    denoised_signal=denoised_np,
-                    mask_start=mask_start,
-                    mask_end=mask_end,
-                    modulation=modulation,
-                    snr=snr,
-                    output_path=str(output_path),
-                    dpi=args.dpi
-                )
-                
-                collected += 1
-                print(f"Processed sample {collected}/{args.num_samples}: {modulation} at SNR={snr:.0f}dB, "
-                      f"Mask: [{mask_start}, {mask_end})")
+                ood_label = f"ID(class:{label.item()})"
+            
+            # Convert to numpy
+            noisy_np = noisy.cpu().numpy()[0]  # [2, 128]
+            clean_np = clean.cpu().numpy()[0]  # [2, 128]
+            denoised_np = denoised.cpu().numpy()[0]  # [2, 128]
+            
+            # Find masked region
+            mask_start, mask_end = find_mask_region(noisy_np, args.mask_ratio)
+            
+            # Store sample data
+            samples_data.append({
+                'idx': idx,
+                'noisy': noisy_np,
+                'clean': clean_np,
+                'denoised': denoised_np,
+                'mask_start': mask_start,
+                'mask_end': mask_end,
+                'modulation': modulation,
+                'snr': snr,
+                'label': label.item(),
+                'is_ood': is_ood
+            })
+            
+            # Visualize individual sample
+            sample_type = "OOD" if is_ood else "ID"
+            output_path = Path(args.output_dir) / f'sample_{idx:02d}_{sample_type}_{modulation}_snr{snr:.0f}.png'
+            visualize_sample(
+                idx=idx,
+                noisy_signal=noisy_np,
+                clean_signal=clean_np,
+                denoised_signal=denoised_np,
+                mask_start=mask_start,
+                mask_end=mask_end,
+                modulation=f"{modulation} [{ood_label}]",
+                snr=snr,
+                output_path=str(output_path),
+                dpi=args.dpi
+            )
+            
+            print(f"  [{idx+1}/{total_samples}] {sample_type:3s} | {modulation:8s} | SNR={snr:3.0f}dB | Mask:[{mask_start:3d},{mask_end:3d})")
     
     # Create summary plot
     if len(samples_data) > 0:
         summary_path = Path(args.output_dir) / 'summary_all_samples.png'
         create_summary_plot(samples_data, str(summary_path), dpi=args.dpi)
         
+        # Calculate final statistics
+        num_id_final = sum(1 for s in samples_data if not s.get('is_ood', False))
+        num_ood_final = sum(1 for s in samples_data if s.get('is_ood', False))
+        
         print(f"\n{'='*70}")
         print(f"Visualization complete!")
         print(f"Total samples visualized: {len(samples_data)}")
+        print(f"  - ID samples: {num_id_final}")
+        print(f"  - OOD samples: {num_ood_final}")
         print(f"Output directory: {args.output_dir}")
+        print(f"\nGenerated files:")
+        print(f"  - {len(samples_data)} individual sample plots")
+        print(f"  - 1 summary plot (summary_all_samples.png)")
         print(f"{'='*70}")
     else:
         print("No valid samples found for visualization!")

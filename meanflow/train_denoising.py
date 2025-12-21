@@ -532,6 +532,11 @@ def evaluate(
     # Initialize OOD detector for residual spectrum analysis
     ood_detector = AdvancedOODDetector(model)
     
+    # Debug counters
+    total_samples = 0
+    id_sample_count = 0
+    ood_sample_count = 0
+    
     # Store data for OOD evaluation
     ood_labels = [] # 0=known, 1=unknown
     
@@ -630,6 +635,11 @@ def evaluate(
             is_id = (labels != -1).cpu().numpy().astype(bool)
             ood_labels.extend(is_ood)
             
+            # Debug: count samples
+            total_samples += len(labels)
+            id_sample_count += is_id.sum()
+            ood_sample_count += (~is_id).sum()
+            
             # OOD Scores:
             # 1. Min Error: Higher error = OOD. Score = Min Error
             ood_min_errors.extend(batch_min_errors.cpu().numpy())
@@ -698,6 +708,16 @@ def evaluate(
                 modulation_metrics[mod]['snr_imp'].append(sample_metrics['snr_improvement'])
                 modulation_metrics[mod]['corr'].append(sample_metrics['correlation'])
     
+    # Debug: print sample distribution
+    logger.info(f'\nDataset Statistics:')
+    logger.info(f'  Total samples evaluated: {total_samples}')
+    logger.info(f'  ID samples: {id_sample_count} ({100*id_sample_count/total_samples:.1f}%)')
+    logger.info(f'  OOD samples: {ood_sample_count} ({100*ood_sample_count/total_samples:.1f}%)')
+    logger.info(f'  ID MSE list length: {len(id_mse)}')
+    logger.info(f'  OOD MSE list length: {len(ood_mse)}')
+    logger.info(f'  ID MSE avg list length: {len(id_mse_avg)}')
+    logger.info(f'  OOD MSE avg list length: {len(ood_mse_avg)}')
+    
     # Calculate AUROC/AUPR for all metrics if we have both positive and negative classes
     ood_labels_arr = np.array(ood_labels)
     
@@ -735,15 +755,14 @@ def evaluate(
         **residual_spectrum_auroc_metrics
     }
     
-    # Add separate ID and OOD metrics
-    if len(id_mse) > 0:
-        metrics['eval/id_mse_min'] = np.mean(id_mse)  # Min MSE (best hypothesis)
-        metrics['eval/id_mse_avg'] = np.mean(id_mse_avg)  # Average MSE across all classes
-        metrics['eval/id_residual_spectrum'] = np.mean(id_residual_spectrum_scores) if len(id_residual_spectrum_scores) > 0 else 0.0
-    if len(ood_mse) > 0:
-        metrics['eval/ood_mse_min'] = np.mean(ood_mse)  # Min MSE (best hypothesis)
-        metrics['eval/ood_mse_avg'] = np.mean(ood_mse_avg)  # Average MSE across all classes
-        metrics['eval/ood_residual_spectrum'] = np.mean(ood_residual_spectrum_scores) if len(ood_residual_spectrum_scores) > 0 else 0.0
+    # Add separate ID and OOD metrics (always add to ensure consistency in WandB)
+    metrics['eval/id_mse_min'] = np.mean(id_mse) if len(id_mse) > 0 else 0.0
+    metrics['eval/id_mse_avg'] = np.mean(id_mse_avg) if len(id_mse_avg) > 0 else 0.0
+    metrics['eval/id_residual_spectrum'] = np.mean(id_residual_spectrum_scores) if len(id_residual_spectrum_scores) > 0 else 0.0
+    
+    metrics['eval/ood_mse_min'] = np.mean(ood_mse) if len(ood_mse) > 0 else 0.0
+    metrics['eval/ood_mse_avg'] = np.mean(ood_mse_avg) if len(ood_mse_avg) > 0 else 0.0
+    metrics['eval/ood_residual_spectrum'] = np.mean(ood_residual_spectrum_scores) if len(ood_residual_spectrum_scores) > 0 else 0.0
     
     # Add per-SNR metrics
     for snr, snr_data in sorted(snr_metrics.items()):
@@ -770,14 +789,14 @@ def evaluate(
     
     # Log ID vs OOD metrics
     logger.info(f'\nID vs OOD Metrics:')
-    if 'eval/id_mse_min' in metrics:
-        logger.info(f'  ID MSE (min): {metrics["eval/id_mse_min"]:.6f}')
-        logger.info(f'  ID MSE (avg): {metrics["eval/id_mse_avg"]:.6f}')
-        logger.info(f'  ID Residual Spectrum: {metrics["eval/id_residual_spectrum"]:.4f}')
-    if 'eval/ood_mse_min' in metrics:
-        logger.info(f'  OOD MSE (min): {metrics["eval/ood_mse_min"]:.6f}')
-        logger.info(f'  OOD MSE (avg): {metrics["eval/ood_mse_avg"]:.6f}')
-        logger.info(f'  OOD Residual Spectrum: {metrics["eval/ood_residual_spectrum"]:.4f}')
+    logger.info(f'  ID Samples: {len(id_mse)}')
+    logger.info(f'  ID MSE (min): {metrics["eval/id_mse_min"]:.6f}')
+    logger.info(f'  ID MSE (avg): {metrics["eval/id_mse_avg"]:.6f}')
+    logger.info(f'  ID Residual Spectrum: {metrics["eval/id_residual_spectrum"]:.4f}')
+    logger.info(f'  OOD Samples: {len(ood_mse)}')
+    logger.info(f'  OOD MSE (min): {metrics["eval/ood_mse_min"]:.6f}')
+    logger.info(f'  OOD MSE (avg): {metrics["eval/ood_mse_avg"]:.6f}')
+    logger.info(f'  OOD Residual Spectrum: {metrics["eval/ood_residual_spectrum"]:.4f}')
     
     # Log AUROC metrics
     logger.info(f'\nOOD Detection Performance (AUROC):')

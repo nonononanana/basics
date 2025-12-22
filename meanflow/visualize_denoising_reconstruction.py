@@ -540,7 +540,7 @@ def main():
                     denoised_hypothesis = model.denoise(
                         x_noisy=noisy,
                         class_labels=hypothesis_label,
-                        num_steps=1
+                        num_steps=20
                     )
                     
                     # Compute reconstruction error (blind metric: correlation with noisy input)
@@ -567,7 +567,7 @@ def main():
                 denoised = model.denoise(
                     x_noisy=noisy,
                     class_labels=label,
-                    num_steps=1
+                    num_steps=20
                 )
                 ood_label = f"ID(class:{label.item()})"
             

@@ -120,8 +120,16 @@ def find_mask_region(noisy_signal: np.ndarray, mask_ratio: float) -> Tuple[int, 
     Returns:
         (start_idx, end_idx) of masked region, or (-1, -1) if no mask detected
     """
+    # If no masking was applied (mask_ratio == 0), return no mask region
+    if mask_ratio == 0.0:
+        return -1, -1
+    
     signal_length = noisy_signal.shape[1]
     expected_mask_len = int(signal_length * mask_ratio)
+    
+    # If expected mask length is 0, return no mask
+    if expected_mask_len == 0:
+        return -1, -1
     
     # Check I channel for consecutive zeros
     i_channel = noisy_signal[0, :]
@@ -187,14 +195,20 @@ def visualize_sample(
         dpi: DPI for saved figure
     """
     fig, axes = plt.subplots(3, 2, figsize=(20, 12))
-    fig.suptitle(f'Sample {idx} - {modulation} at SNR={snr:.0f}dB', fontsize=16, fontweight='bold')
+    
+    # Determine if masking was used
+    has_mask = mask_start >= 0 and mask_end >= 0
+    task_type = 'Denoising + Reconstruction' if has_mask else 'Denoising Only'
+    
+    fig.suptitle(f'Sample {idx} - {modulation} at SNR={snr:.0f}dB\n[{task_type}]', 
+                 fontsize=16, fontweight='bold')
     
     time_steps = np.arange(128)
     
-    # Row 1: Noisy Signal (with mask highlighted)
+    # Row 1: Noisy Signal (with mask highlighted if present)
     # I channel
     axes[0, 0].plot(time_steps, noisy_signal[0, :], 'b-', linewidth=1.5, label='I channel')
-    if mask_start >= 0 and mask_end >= 0:
+    if has_mask:
         axes[0, 0].axvspan(mask_start, mask_end, alpha=0.3, color='red', label='Masked region')
     axes[0, 0].set_title('Noisy Input - I Channel', fontsize=12, fontweight='bold')
     axes[0, 0].set_xlabel('Time Step')
@@ -204,7 +218,7 @@ def visualize_sample(
     
     # Q channel
     axes[0, 1].plot(time_steps, noisy_signal[1, :], 'r-', linewidth=1.5, label='Q channel')
-    if mask_start >= 0 and mask_end >= 0:
+    if has_mask:
         axes[0, 1].axvspan(mask_start, mask_end, alpha=0.3, color='red', label='Masked region')
     axes[0, 1].set_title('Noisy Input - Q Channel', fontsize=12, fontweight='bold')
     axes[0, 1].set_xlabel('Time Step')
@@ -215,7 +229,7 @@ def visualize_sample(
     # Row 2: Clean Signal (Ground Truth)
     # I channel
     axes[1, 0].plot(time_steps, clean_signal[0, :], 'g-', linewidth=1.5, label='I channel')
-    if mask_start >= 0 and mask_end >= 0:
+    if has_mask:
         axes[1, 0].axvspan(mask_start, mask_end, alpha=0.2, color='yellow', label='Original mask region')
     axes[1, 0].set_title('Clean Ground Truth - I Channel', fontsize=12, fontweight='bold')
     axes[1, 0].set_xlabel('Time Step')
@@ -225,7 +239,7 @@ def visualize_sample(
     
     # Q channel
     axes[1, 1].plot(time_steps, clean_signal[1, :], 'm-', linewidth=1.5, label='Q channel')
-    if mask_start >= 0 and mask_end >= 0:
+    if has_mask:
         axes[1, 1].axvspan(mask_start, mask_end, alpha=0.2, color='yellow', label='Original mask region')
     axes[1, 1].set_title('Clean Ground Truth - Q Channel', fontsize=12, fontweight='bold')
     axes[1, 1].set_xlabel('Time Step')
@@ -233,24 +247,25 @@ def visualize_sample(
     axes[1, 1].grid(True, alpha=0.3)
     axes[1, 1].legend()
     
-    # Row 3: Denoised+Reconstructed Signal
+    # Row 3: Denoised/Reconstructed Signal
     # I channel
-    axes[2, 0].plot(time_steps, denoised_signal[0, :], 'c-', linewidth=1.5, label='I channel (denoised)')
+    row3_title = 'Denoised+Reconstructed' if has_mask else 'Denoised'
+    axes[2, 0].plot(time_steps, denoised_signal[0, :], 'c-', linewidth=1.5, label='I channel (output)')
     axes[2, 0].plot(time_steps, clean_signal[0, :], 'g--', linewidth=1.0, alpha=0.5, label='Ground truth')
-    if mask_start >= 0 and mask_end >= 0:
-        axes[2, 0].axvspan(mask_start, mask_end, alpha=0.3, color='orange', label='Reconstructed mask region')
-    axes[2, 0].set_title('Denoised+Reconstructed - I Channel', fontsize=12, fontweight='bold')
+    if has_mask:
+        axes[2, 0].axvspan(mask_start, mask_end, alpha=0.3, color='orange', label='Reconstructed region')
+    axes[2, 0].set_title(f'{row3_title} - I Channel', fontsize=12, fontweight='bold')
     axes[2, 0].set_xlabel('Time Step')
     axes[2, 0].set_ylabel('Amplitude')
     axes[2, 0].grid(True, alpha=0.3)
     axes[2, 0].legend()
     
     # Q channel
-    axes[2, 1].plot(time_steps, denoised_signal[1, :], 'y-', linewidth=1.5, label='Q channel (denoised)')
+    axes[2, 1].plot(time_steps, denoised_signal[1, :], 'y-', linewidth=1.5, label='Q channel (output)')
     axes[2, 1].plot(time_steps, clean_signal[1, :], 'm--', linewidth=1.0, alpha=0.5, label='Ground truth')
-    if mask_start >= 0 and mask_end >= 0:
-        axes[2, 1].axvspan(mask_start, mask_end, alpha=0.3, color='orange', label='Reconstructed mask region')
-    axes[2, 1].set_title('Denoised+Reconstructed - Q Channel', fontsize=12, fontweight='bold')
+    if has_mask:
+        axes[2, 1].axvspan(mask_start, mask_end, alpha=0.3, color='orange', label='Reconstructed region')
+    axes[2, 1].set_title(f'{row3_title} - Q Channel', fontsize=12, fontweight='bold')
     axes[2, 1].set_xlabel('Time Step')
     axes[2, 1].set_ylabel('Amplitude')
     axes[2, 1].grid(True, alpha=0.3)
@@ -305,21 +320,27 @@ def create_summary_plot(
         label_color = 'red' if is_ood else 'black'
         sample_type = 'OOD' if is_ood else 'ID'
         
+        # Determine if this sample has masking
+        has_mask = mask_start >= 0 and mask_end >= 0
+        
         # Column 1: Noisy
         axes[idx, 0].plot(time_steps, noisy[0, :], 'b-', linewidth=1.0)
-        if mask_start >= 0 and mask_end >= 0:
+        if has_mask:
             axes[idx, 0].axvspan(mask_start, mask_end, alpha=0.3, color='red')
         axes[idx, 0].set_ylabel(f'[{sample_type}] {modulation}\nSNR={snr:.0f}dB', 
                                 fontsize=9, color=label_color, fontweight='bold' if is_ood else 'normal')
         axes[idx, 0].grid(True, alpha=0.3)
         if idx == 0:
-            axes[idx, 0].set_title('Noisy Input (masked)', fontsize=11, fontweight='bold')
+            # Check if any sample has masking for the title
+            any_mask = any(s.get('mask_start', -1) >= 0 for s in samples_data)
+            col1_title = 'Noisy Input (masked)' if any_mask else 'Noisy Input'
+            axes[idx, 0].set_title(col1_title, fontsize=11, fontweight='bold')
         if idx == num_samples - 1:
             axes[idx, 0].set_xlabel('Time Step')
         
         # Column 2: Clean
         axes[idx, 1].plot(time_steps, clean[0, :], 'g-', linewidth=1.0)
-        if mask_start >= 0 and mask_end >= 0:
+        if has_mask:
             axes[idx, 1].axvspan(mask_start, mask_end, alpha=0.2, color='yellow')
         axes[idx, 1].grid(True, alpha=0.3)
         if idx == 0:
@@ -328,13 +349,16 @@ def create_summary_plot(
             axes[idx, 1].set_xlabel('Time Step')
         
         # Column 3: Denoised
-        axes[idx, 2].plot(time_steps, denoised[0, :], 'c-', linewidth=1.0, label='Denoised')
+        axes[idx, 2].plot(time_steps, denoised[0, :], 'c-', linewidth=1.0, label='Output')
         axes[idx, 2].plot(time_steps, clean[0, :], 'g--', linewidth=0.8, alpha=0.5, label='GT')
-        if mask_start >= 0 and mask_end >= 0:
+        if has_mask:
             axes[idx, 2].axvspan(mask_start, mask_end, alpha=0.3, color='orange')
         axes[idx, 2].grid(True, alpha=0.3)
         if idx == 0:
-            axes[idx, 2].set_title('Denoised+Reconstructed', fontsize=11, fontweight='bold')
+            # Check if any sample has masking for the title
+            any_mask = any(s.get('mask_start', -1) >= 0 for s in samples_data)
+            col3_title = 'Denoised+Reconstructed' if any_mask else 'Denoised'
+            axes[idx, 2].set_title(col3_title, fontsize=11, fontweight='bold')
             axes[idx, 2].legend(loc='upper right', fontsize=8)
         if idx == num_samples - 1:
             axes[idx, 2].set_xlabel('Time Step')
@@ -585,7 +609,12 @@ def main():
                 dpi=args.dpi
             )
             
-            print(f"  [{idx+1}/{total_samples}] {sample_type:3s} | {modulation:8s} | SNR={snr:3.0f}dB | Mask:[{mask_start:3d},{mask_end:3d})")
+            # Display mask info
+            if mask_start >= 0 and mask_end >= 0:
+                mask_info = f"Mask:[{mask_start:3d},{mask_end:3d})"
+            else:
+                mask_info = "No mask      "
+            print(f"  [{idx+1}/{total_samples}] {sample_type:3s} | {modulation:8s} | SNR={snr:3.0f}dB | {mask_info}")
     
     # Create summary plot
     if len(samples_data) > 0:
